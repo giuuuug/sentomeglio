@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical">
+
+    <TextView
+        android:id="@+id/toolbarTitle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="SentoMeglio"
+        android:textSize="20sp"
+        android:textColor="@color/colorOnSurface"
+        android:letterSpacing="-0.02" />
+
+    <TextView
+        android:id="@+id/toolbarDevBadge"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="10dp"
+        android:text="DEV"
+        android:textSize="10sp"
+        android:textColor="@color/colorPrimary"
+        android:fontFamily="monospace"
+        android:letterSpacing="0.05"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:paddingTop="3dp"
+        android:paddingBottom="3dp"
+        android:background="@drawable/bg_dev_badge"
+        android:visibility="gone" />
+
+</LinearLayout>
