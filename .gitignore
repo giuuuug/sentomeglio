@@ -2,3 +2,4 @@
 /erb_tcnn_stream.py
 /realtime_erb_tcnn_gui.py
 /user_config.yaml
+*.onnx

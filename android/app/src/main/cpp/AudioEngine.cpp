@@ -1,42 +1,73 @@
 #include "AudioEngine.h"
+#include <algorithm>
 #include <android/log.h>
 #include <chrono>
-#include <algorithm>
+#include <cstring>
+#include <sys/resource.h>
 
 #define TAG "AudioEngine"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 
-AudioEngine::AudioEngine() {
-}
+AudioEngine::AudioEngine()  {}
+AudioEngine::~AudioEngine() { stop(); }
 
-AudioEngine::~AudioEngine() {
-    stop();
-}
+// ── Public API ────────────────────────────────────────────────────────────────
 
-bool AudioEngine::start(int inputDeviceId, int outputDeviceId, const std::string& modelPath, int nFft, int hopLength, int winLength) {
-    if (!openStreams(inputDeviceId, outputDeviceId)) {
+bool AudioEngine::start(int inputDeviceId, int outputDeviceId,
+                        const std::string& modelPath, int nFft, int hopLength,
+                        int winLength) {
+    // Create enhancer FIRST so openStreams() can use the real hopLength.
+    mEnhancer = std::make_unique<StreamingOnnxEnhancer>(
+        modelPath, mAiRate, nFft, hopLength, winLength);
+
+    if (!openStreams(inputDeviceId, outputDeviceId, hopLength)) {
+        mEnhancer.reset();
         return false;
     }
-    
-    mEnhancer = std::make_unique<StreamingOnnxEnhancer>(modelPath, 16000, nFft, hopLength, winLength);
-    
+
+    // Start inference thread before streams so it's already running when the
+    // first hops arrive from the callback.
+    mInferenceRunning.store(true, std::memory_order_relaxed);
+    mInferenceThread = std::thread(&AudioEngine::inferenceLoop, this);
+
     oboe::Result result = mRecordingStream->requestStart();
     if (result != oboe::Result::OK) {
-        LOGE("Error starting recording stream: %s", oboe::convertToText(result));
+        LOGE("Failed to start recording stream: %s", oboe::convertToText(result));
+        mInferenceRunning.store(false, std::memory_order_relaxed);
+        mInferenceThread.join();
         closeStreams();
+        mEnhancer.reset();
         return false;
     }
 
     result = mPlaybackStream->requestStart();
     if (result != oboe::Result::OK) {
-        LOGE("Error starting playback stream: %s", oboe::convertToText(result));
+        LOGE("Failed to start playback stream: %s", oboe::convertToText(result));
+        mInferenceRunning.store(false, std::memory_order_relaxed);
+        mInferenceThread.join();
         closeStreams();
+        mEnhancer.reset();
         return false;
     }
 
-    LOGD("Audio streams started successfully.");
+    LOGD("Audio started. HW=%d Hz, AI=%d Hz, hop=%d, burst=%d",
+         mHwRate, mAiRate, hopLength,
+         mPlaybackStream ? mPlaybackStream->getFramesPerBurst() : -1);
     return true;
+}
+
+void AudioEngine::stop() {
+    // 1. Stop streams — this prevents any further onAudioReady calls.
+    closeStreams();
+
+    // 2. Signal inference thread to exit and wait for it.
+    mInferenceRunning.store(false, std::memory_order_relaxed);
+    if (mInferenceThread.joinable()) {
+        mInferenceThread.join();
+    }
+
+    mEnhancer.reset();
 }
 
 void AudioEngine::getSpectrograms(std::vector<float>& noisyDb, std::vector<float>& denDb) {
@@ -45,78 +76,129 @@ void AudioEngine::getSpectrograms(std::vector<float>& noisyDb, std::vector<float
     }
 }
 
-void AudioEngine::stop() {
-    closeStreams();
-}
-
 double AudioEngine::getInferenceLatencyMs() const {
-    if (mEnhancer) return mEnhancer->getInferenceLatencyMs();
-    return 0.0;
+    return mEnhancer ? mEnhancer->getInferenceLatencyMs() : 0.0;
 }
 
 double AudioEngine::getDspLatencyMs() const {
-    if (mEnhancer) return mEnhancer->getDspLatencyMs();
-    return 0.0;
+    return mEnhancer ? mEnhancer->getDspLatencyMs() : 0.0;
 }
 
 double AudioEngine::getHwLatencyMs() const {
     double inputLatMs = 0.0, outputLatMs = 0.0;
     if (mRecordingStream) {
-        auto result = mRecordingStream->calculateLatencyMillis();
-        if (result) inputLatMs = result.value();
+        auto r = mRecordingStream->calculateLatencyMillis();
+        if (r) inputLatMs = r.value();
     }
     if (mPlaybackStream) {
-        auto result = mPlaybackStream->calculateLatencyMillis();
-        if (result) outputLatMs = result.value();
+        auto r = mPlaybackStream->calculateLatencyMillis();
+        if (r) outputLatMs = r.value();
     }
     return inputLatMs + outputLatMs;
 }
 
-bool AudioEngine::openStreams(int inputDeviceId, int outputDeviceId) {
+// ── Stream management ─────────────────────────────────────────────────────────
+
+bool AudioEngine::openStreams(int inputDeviceId, int outputDeviceId, int hopLength) {
+    mHopLength = hopLength;
+
+    // Request Exclusive mode for minimum mixer overhead on built-in devices.
+    // Oboe automatically falls back to Shared for Bluetooth SCO/A2DP.
     oboe::AudioStreamBuilder inBuilder;
     inBuilder.setDirection(oboe::Direction::Input)
-             ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-             ->setSharingMode(oboe::SharingMode::Exclusive)
-             ->setFormat(oboe::AudioFormat::Float)
-             ->setChannelCount(1)
-             ->setDeviceId(inputDeviceId);
-    
+        ->setFormat(oboe::AudioFormat::Float)
+        ->setChannelCount(1)
+        ->setDeviceId(inputDeviceId)
+        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+        ->setSharingMode(oboe::SharingMode::Exclusive);
+
     oboe::Result result = inBuilder.openStream(mRecordingStream);
     if (result != oboe::Result::OK) {
-        LOGE("Failed to open recording stream. Error: %s", oboe::convertToText(result));
+        LOGE("Failed to open recording stream: %s", oboe::convertToText(result));
         return false;
     }
+
+    mHwRate = mRecordingStream->getSampleRate();
+    LOGD("Recording: rate=%d burst=%d sharing=%d perf=%d",
+         mHwRate,
+         mRecordingStream->getFramesPerBurst(),
+         (int)mRecordingStream->getSharingMode(),
+         (int)mRecordingStream->getPerformanceMode());
 
     oboe::AudioStreamBuilder outBuilder;
     outBuilder.setDirection(oboe::Direction::Output)
-              ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-              ->setSharingMode(oboe::SharingMode::Exclusive)
-              ->setFormat(oboe::AudioFormat::Float)
-              ->setChannelCount(1)
-              ->setSampleRate(mRecordingStream->getSampleRate())
-              ->setDeviceId(outputDeviceId)
-              ->setDataCallback(this)
-              ->setErrorCallback(this);
+        ->setFormat(oboe::AudioFormat::Float)
+        ->setChannelCount(1)
+        ->setSampleRate(mHwRate)
+        ->setDeviceId(outputDeviceId)
+        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+        ->setSharingMode(oboe::SharingMode::Exclusive)
+        ->setDataCallback(this)
+        ->setErrorCallback(this);
 
     result = outBuilder.openStream(mPlaybackStream);
     if (result != oboe::Result::OK) {
-        LOGE("Failed to open playback stream. Error: %s", oboe::convertToText(result));
+        LOGE("Failed to open playback stream: %s", oboe::convertToText(result));
         mRecordingStream->close();
+        mRecordingStream.reset();
         return false;
     }
 
-    int hwRate = mRecordingStream->getSampleRate();
-    int aiRate = 16000;
-    
-    mDownsampler = std::make_unique<SimpleResampler>(hwRate, aiRate);
-    mUpsampler = std::make_unique<SimpleResampler>(aiRate, hwRate);
-    
-    int maxFrames = mRecordingStream->getFramesPerBurst() * 4; // safe margin
-    if (maxFrames < 2048) maxFrames = 2048;
-    
-    mInputBuffer.resize(maxFrames);
-    mAiBuffer.resize(maxFrames);
-    mOutputFifo.clear();
+    // Minimize hardware output buffer: 2x burst is the smallest stable size.
+    int32_t burst = mPlaybackStream->getFramesPerBurst();
+    mPlaybackStream->setBufferSizeInFrames(2 * burst);
+
+    LOGD("Playback: rate=%d burst=%d bufSize=%d sharing=%d perf=%d",
+         mPlaybackStream->getSampleRate(), burst,
+         mPlaybackStream->getBufferSizeInFrames(),
+         (int)mPlaybackStream->getSharingMode(),
+         (int)mPlaybackStream->getPerformanceMode());
+
+    // Resamplers
+    if (mHwRate != mAiRate) {
+        mDownsampler = std::make_unique<SimpleResampler>(mHwRate, mAiRate);
+        mUpsampler   = std::make_unique<SimpleResampler>(mAiRate, mHwRate);
+    } else {
+        mDownsampler.reset();
+        mUpsampler.reset();
+    }
+
+    // Callback scratch buffers (sized for worst-case burst)
+    int maxHwFrames = std::max(mRecordingStream->getFramesPerBurst(), burst) * 4;
+    if (maxHwFrames < 4096) maxHwFrames = 4096;
+    mInputBuffer.resize(maxHwFrames);
+
+    int maxAiFrames = (maxHwFrames * mAiRate / mHwRate) + 16;
+    if (maxAiFrames < 4096) maxAiFrames = 4096;
+    mAiBuffer.resize(maxAiFrames);
+
+    // AI input FIFO — callback writes, inference thread reads
+    mAiFifoCapacity = maxAiFrames * 8;
+    mAiFifo.assign(mAiFifoCapacity, 0.0f);
+    mAiFifoReadIdx  = 0;
+    mAiFifoWriteIdx = 0;
+    mAiFifoCount.store(0, std::memory_order_relaxed);
+
+    // Output FIFO — inference thread writes, callback reads
+    // Size: 16 hops at HW rate is plenty of buffer headroom.
+    int hopHwFrames = (hopLength * mHwRate / mAiRate) + 4;
+    mFifoCapacity = hopHwFrames * 16;
+    if (mFifoCapacity < 4096) mFifoCapacity = 4096;
+    mOutputFifo.assign(mFifoCapacity, 0.0f);
+    mFifoReadIdx  = 0;
+    mFifoWriteIdx = 0;
+
+    // Pre-fill with 3 hops of silence so the callback doesn't underrun during
+    // the first inference iterations.
+    int preFill = std::min(hopHwFrames * 3, mFifoCapacity);
+    mFifoWriteIdx = preFill;
+    mFifoCount.store(preFill, std::memory_order_relaxed);
+
+    // Inference-thread scratch buffers (exact sizes, no resizing at runtime)
+    mHopBuffer.assign(hopLength, 0.0f);
+    mHopOutBuffer.assign(hopLength, 0.0f);
+    int maxUpsampled = (hopLength * mHwRate / mAiRate) + 4;
+    mTempOut.resize(maxUpsampled);
 
     return true;
 }
@@ -134,88 +216,126 @@ void AudioEngine::closeStreams() {
     }
 }
 
-oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *audioStream, void *audioData, int32_t numFrames) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-    float *outputBuffer = static_cast<float *>(audioData);
+// ── SPSC FIFO helpers ─────────────────────────────────────────────────────────
+//
+// Output FIFO: inference thread = producer, callback = consumer.
+// The acquire/release pairing on mFifoCount ensures written data is visible
+// to the consumer before the count increment is published.
 
-    if (mRecordingStream) {
-        if (mInputBuffer.size() < numFrames) {
-            mInputBuffer.resize(numFrames * 2);
-        }
-        
-        oboe::ResultWithValue<int32_t> result = mRecordingStream->read(mInputBuffer.data(), numFrames, 0);
-        int32_t framesRead = result.value() > 0 ? result.value() : 0;
-        
-        // Zero-fill if underrun
-        for (int i = framesRead; i < numFrames; ++i) {
-            mInputBuffer[i] = 0.0f;
+void AudioEngine::outFifoWrite(const float* data, int count) {
+    int space = mFifoCapacity - mFifoCount.load(std::memory_order_acquire);
+    int n = std::min(count, space);
+    for (int i = 0; i < n; ++i) {
+        mOutputFifo[mFifoWriteIdx] = data[i];
+        if (++mFifoWriteIdx == mFifoCapacity) mFifoWriteIdx = 0;
+    }
+    if (n > 0) mFifoCount.fetch_add(n, std::memory_order_release);
+}
+
+int AudioEngine::outFifoRead(float* data, int count) {
+    int avail = mFifoCount.load(std::memory_order_acquire);
+    int n = std::min(count, avail);
+    for (int i = 0; i < n; ++i) {
+        data[i] = mOutputFifo[mFifoReadIdx];
+        if (++mFifoReadIdx == mFifoCapacity) mFifoReadIdx = 0;
+    }
+    if (n > 0) mFifoCount.fetch_sub(n, std::memory_order_release);
+    return n;
+}
+
+// AI FIFO: callback = producer, inference thread = consumer.
+
+void AudioEngine::aiFifoWrite(const float* data, int count) {
+    int space = mAiFifoCapacity - mAiFifoCount.load(std::memory_order_acquire);
+    int n = std::min(count, space);
+    for (int i = 0; i < n; ++i) {
+        mAiFifo[mAiFifoWriteIdx] = data[i];
+        if (++mAiFifoWriteIdx == mAiFifoCapacity) mAiFifoWriteIdx = 0;
+    }
+    if (n > 0) mAiFifoCount.fetch_add(n, std::memory_order_release);
+}
+
+int AudioEngine::aiFifoRead(float* data, int count) {
+    int avail = mAiFifoCount.load(std::memory_order_acquire);
+    int n = std::min(count, avail);
+    for (int i = 0; i < n; ++i) {
+        data[i] = mAiFifo[mAiFifoReadIdx];
+        if (++mAiFifoReadIdx == mAiFifoCapacity) mAiFifoReadIdx = 0;
+    }
+    if (n > 0) mAiFifoCount.fetch_sub(n, std::memory_order_release);
+    return n;
+}
+
+// ── Inference thread ──────────────────────────────────────────────────────────
+
+void AudioEngine::inferenceLoop() {
+    // Raise thread priority slightly (best-effort; won't fail if denied).
+    setpriority(PRIO_PROCESS, 0, -8);
+
+    while (mInferenceRunning.load(std::memory_order_relaxed)) {
+        // Wait until a full hop is available.
+        if (mAiFifoCount.load(std::memory_order_acquire) < mHopLength) {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            continue;
         }
 
-        int hwRate = mRecordingStream->getSampleRate();
-        int aiRate = 16000;
+        aiFifoRead(mHopBuffer.data(), mHopLength);
 
-        // 1. Downsample to 16kHz
-        int aiMaxFrames = (numFrames * aiRate / hwRate) + 10;
-        if (mAiBuffer.size() < aiMaxFrames) {
-            mAiBuffer.resize(aiMaxFrames);
+        if (mEnhancer) {
+            mEnhancer->processHop(mHopBuffer.data(), mHopOutBuffer.data());
+        } else {
+            std::memcpy(mHopOutBuffer.data(), mHopBuffer.data(), mHopLength * sizeof(float));
         }
-        
-        int aiFrames = mDownsampler->resample(mInputBuffer.data(), numFrames, mAiBuffer.data());
-        
-        // 2. --- NEURAL NETWORK PROCESSING at 16kHz ---
-        int hopSize = mEnhancer ? mEnhancer->getHopLength() : 128;
-        if (mHopBuffer.size() < hopSize) mHopBuffer.resize(hopSize, 0.0f);
-        if (mHopOutBuffer.size() < hopSize) mHopOutBuffer.resize(hopSize, 0.0f);
-        
-        std::vector<float> processedAi;
-        processedAi.reserve(aiFrames + hopSize);
 
-        // We need a proper FIFO for ML input if aiFrames is not a multiple of hopSize.
-        // For simplicity, we will assume mHopBuffer acts as a persistent FIFO across callbacks.
-        // Let's add mAiFifo to class if needed, but since it's just processing whatever is available:
-        static std::vector<float> sAiFifo; // simple static for now, should be member
-        sAiFifo.insert(sAiFifo.end(), mAiBuffer.begin(), mAiBuffer.begin() + aiFrames);
-        
-        while (sAiFifo.size() >= hopSize) {
-            if (mEnhancer) {
-                mEnhancer->processHop(sAiFifo.data(), mHopOutBuffer.data());
-            } else {
-                std::copy(sAiFifo.begin(), sAiFifo.begin() + hopSize, mHopOutBuffer.begin());
-            }
-            processedAi.insert(processedAi.end(), mHopOutBuffer.begin(), mHopOutBuffer.begin() + hopSize);
-            sAiFifo.erase(sAiFifo.begin(), sAiFifo.begin() + hopSize);
-        }
-        
-        // 3. Upsample back to hardware rate
-        int outMax = (processedAi.size() * hwRate / aiRate) + 10;
-        std::vector<float> tempOut(outMax);
-        int outFrames = mUpsampler->resample(processedAi.data(), processedAi.size(), tempOut.data());
-        
-        mOutputFifo.insert(mOutputFifo.end(), tempOut.begin(), tempOut.begin() + outFrames);
-        
-        int framesToCopy = std::min((int)numFrames, (int)mOutputFifo.size());
-        for (int i = 0; i < framesToCopy; ++i) {
-            outputBuffer[i] = mOutputFifo[i];
-        }
-        
-        mOutputFifo.erase(mOutputFifo.begin(), mOutputFifo.begin() + framesToCopy);
-        
-        for (int i = framesToCopy; i < numFrames; ++i) {
-            outputBuffer[i] = 0.0f;
-        }
-    } else {
-        for (int i = 0; i < numFrames; ++i) {
-            outputBuffer[i] = 0.0f;
+        // Upsample back to HW rate if needed, then push to output FIFO.
+        if (mUpsampler) {
+            int n = mUpsampler->resample(mHopOutBuffer.data(), mHopLength, mTempOut.data());
+            outFifoWrite(mTempOut.data(), n);
+        } else {
+            outFifoWrite(mHopOutBuffer.data(), mHopLength);
         }
     }
+}
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> latency = end_time - start_time;
-    mLastProcessingLatencyMs.store(latency.count());
+// ── Audio callback ────────────────────────────────────────────────────────────
+// This runs on the real-time audio thread. It must never block or allocate.
+
+oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream* /*stream*/,
+                                                    void* audioData,
+                                                    int32_t numFrames) {
+    float* out = static_cast<float*>(audioData);
+
+    if (!mRecordingStream) {
+        std::memset(out, 0, numFrames * sizeof(float));
+        return oboe::DataCallbackResult::Continue;
+    }
+
+    // 1. Read from microphone.
+    auto res = mRecordingStream->read(mInputBuffer.data(), numFrames, 0);
+    int32_t framesRead = (res && res.value() > 0) ? res.value() : 0;
+    if (framesRead < numFrames) {
+        std::memset(mInputBuffer.data() + framesRead, 0,
+                    (numFrames - framesRead) * sizeof(float));
+    }
+
+    // 2. Downsample to AI rate (if needed) and push to AI FIFO.
+    if (mDownsampler) {
+        int n = mDownsampler->resample(mInputBuffer.data(), numFrames, mAiBuffer.data());
+        aiFifoWrite(mAiBuffer.data(), n);
+    } else {
+        aiFifoWrite(mInputBuffer.data(), numFrames);
+    }
+
+    // 3. Read processed audio from output FIFO.
+    int got = outFifoRead(out, numFrames);
+    if (got < numFrames) {
+        // Output FIFO underrun — zero-fill to avoid noise.
+        std::memset(out + got, 0, (numFrames - got) * sizeof(float));
+    }
 
     return oboe::DataCallbackResult::Continue;
 }
 
-void AudioEngine::onErrorAfterClose(oboe::AudioStream *audioStream, oboe::Result error) {
-    LOGE("Error was %s", oboe::convertToText(error));
+void AudioEngine::onErrorAfterClose(oboe::AudioStream* /*stream*/, oboe::Result error) {
+    LOGE("Stream error: %s", oboe::convertToText(error));
 }

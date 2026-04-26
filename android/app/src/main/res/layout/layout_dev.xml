@@ -119,7 +119,7 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:inputType="number"
-                            android:text="512"
+                            android:text="320"
                             android:textSize="13sp"
                             android:fontFamily="monospace"
                             android:textColor="@color/colorPrimary"
@@ -222,7 +222,19 @@
                     android:id="@+id/latencyText"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="E2E: N/A  |  Infer: N/A&#10;Callback: N/A  |  Alg: N/A"
+                    android:text="HW: N/A  |  DSP: N/A  |  Infer: N/A"
+                    android:gravity="center"
+                    android:fontFamily="monospace"
+                    android:textSize="11sp"
+                    android:textColor="@color/colorOnSurfaceVar"
+                    android:layout_marginBottom="2dp" />
+
+                <!-- RT metrics: RTF -->
+                <TextView
+                    android:id="@+id/metricsText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="RTF: N/A"
                     android:gravity="center"
                     android:fontFamily="monospace"
                     android:textSize="11sp"

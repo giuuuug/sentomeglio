@@ -16,6 +16,8 @@ include_directories(onnxruntime_headers)
 add_library(onnxruntime SHARED IMPORTED)
 set_target_properties(onnxruntime PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/onnx_libs/${ANDROID_ABI}/libonnxruntime.so)
 
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -O3 -ffast-math)
+
 target_link_libraries(${CMAKE_PROJECT_NAME}
     android
     log

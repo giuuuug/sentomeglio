@@ -44,7 +44,10 @@ class MainActivity : AppCompatActivity() {
         dailyManager = DailyScreenManager(
             binding = binding.screenDaily,
             onStartRecording = { inputId, outputId -> startDailyAudio(inputId, outputId) },
-            onStopRecording = { NativeBridge.stopAudioEngine() },
+            onStopRecording = {
+                NativeBridge.stopAudioEngine()
+                AudioService.dismiss(this)
+            },
             onSettingsRequested = { openSettings() }
         )
 
@@ -56,9 +59,21 @@ class MainActivity : AppCompatActivity() {
         applyScreenMode()
     }
 
+    override fun onStart() {
+        super.onStart()
+        dailyManager.onStart()
+        devManager.onStart()
+    }
+
     override fun onResume() {
         super.onResume()
         applyScreenMode()
+        // If the service was stopped from the notification while the app was away,
+        // sync manager UI back to idle without touching the engine.
+        if (!AudioService.isRunning) {
+            dailyManager.syncToIdle()
+            devManager.syncToIdle()
+        }
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -101,7 +116,7 @@ class MainActivity : AppCompatActivity() {
         return NativeBridge.startAudioEngine(
             inputId = inputId, outputId = outputId,
             modelPath = modelPath,
-            nFft = 512, hopLength = 128, winLength = 512
+            nFft = 512, hopLength = 128, winLength = 320
         )
     }
 
@@ -154,5 +169,6 @@ class MainActivity : AppCompatActivity() {
         super.onStop()
         dailyManager.onStop()
         devManager.onStop()
+        // Do NOT stop audio here — the foreground service keeps it running in background.
     }
 }

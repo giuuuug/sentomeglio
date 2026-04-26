@@ -4,10 +4,12 @@ import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
 import android.animation.AnimatorSet
+import android.bluetooth.BluetoothAdapter
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Handler
@@ -44,29 +46,90 @@ class DailyScreenManager(
     private val inputDevices = mutableListOf<AudioDeviceItem>()
     private val outputDevices = mutableListOf<AudioDeviceItem>()
     private var scoReceiver: BroadcastReceiver? = null
+    private var scoTimeoutRunnable: Runnable? = null
+    private var previousAudioMode: Int = AudioManager.MODE_NORMAL
 
     companion object {
-        private val LOW_LATENCY_INPUT_TYPES = setOf(
+        private val SUPPORTED_INPUT_TYPES = setOf(
             AudioDeviceInfo.TYPE_BUILTIN_MIC,
             AudioDeviceInfo.TYPE_WIRED_HEADSET,
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
             AudioDeviceInfo.TYPE_USB_DEVICE,
-            AudioDeviceInfo.TYPE_USB_HEADSET
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_HEADSET
         )
-        private val LOW_LATENCY_OUTPUT_TYPES = setOf(
+        private val SUPPORTED_OUTPUT_TYPES = setOf(
             AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
             AudioDeviceInfo.TYPE_WIRED_HEADSET,
             AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
             AudioDeviceInfo.TYPE_USB_DEVICE,
-            AudioDeviceInfo.TYPE_USB_HEADSET
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_SPEAKER
         )
+        private const val SCO_TIMEOUT_MS = 8000L
+    }
+
+    // ── Dynamic device detection ─────────────────────────────────────────────
+
+    private val audioDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+            handler.post { refreshDeviceLists() }
+        }
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+            handler.post {
+                refreshDeviceLists()
+                // If we are recording and a selected device was removed, stop
+                if (state == State.RECORDING) {
+                    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    val currentInputId = (binding.inputSpinner.selectedItem as? AudioDeviceItem)?.id
+                    val currentOutputId = (binding.outputSpinner.selectedItem as? AudioDeviceItem)?.id
+                    if (currentInputId != null && inputDevices.none { it.id == currentInputId } ||
+                        currentOutputId != null && outputDevices.none { it.id == currentOutputId }) {
+                        stopRecording()
+                        Toast.makeText(context, "Dispositivo audio disconnesso, registrazione fermata", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
+
+    private val bluetoothReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            when (intent.action) {
+                BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED,
+                "android.bluetooth.headset.profile.action.CONNECTION_STATE_CHANGED" -> {
+                    // Small delay to let the system register the audio device
+                    handler.postDelayed({ refreshDeviceLists() }, 500)
+                }
+            }
+        }
     }
 
     init {
         populateDeviceLists()
+        registerDeviceCallbacks()
         setupButton()
         updateUi()
+    }
+
+    private fun registerDeviceCallbacks() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.registerAudioDeviceCallback(audioDeviceCallback, handler)
+
+        val btFilter = IntentFilter().apply {
+            addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
+            addAction("android.bluetooth.headset.profile.action.CONNECTION_STATE_CHANGED")
+        }
+        context.registerReceiver(bluetoothReceiver, btFilter)
+    }
+
+    private fun unregisterDeviceCallbacks() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+        try { context.unregisterReceiver(bluetoothReceiver) } catch (_: Exception) {}
     }
 
     // ── Device selection ─────────────────────────────────────────────────────
@@ -77,17 +140,13 @@ class DailyScreenManager(
         inputDevices.clear()
         outputDevices.clear()
 
-        val seenInputTypes = mutableSetOf<Int>()
         for (device in audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
-            if (device.type !in LOW_LATENCY_INPUT_TYPES) continue
-            if (!seenInputTypes.add(device.type)) continue
+            if (device.type !in SUPPORTED_INPUT_TYPES) continue
             inputDevices.add(AudioDeviceItem(deviceLabel(device), device.id, device.type))
         }
 
-        val seenOutputTypes = mutableSetOf<Int>()
         for (device in audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-            if (device.type !in LOW_LATENCY_OUTPUT_TYPES) continue
-            if (!seenOutputTypes.add(device.type)) continue
+            if (device.type !in SUPPORTED_OUTPUT_TYPES) continue
             outputDevices.add(AudioDeviceItem(deviceLabel(device), device.id, device.type))
         }
 
@@ -100,6 +159,26 @@ class DailyScreenManager(
         binding.outputSpinner.adapter = outAdapter
     }
 
+    private fun refreshDeviceLists() {
+        // Save current selections
+        val prevInputId = (binding.inputSpinner.selectedItem as? AudioDeviceItem)?.id
+        val prevOutputId = (binding.outputSpinner.selectedItem as? AudioDeviceItem)?.id
+
+        populateDeviceLists()
+
+        // Restore previous selections if they still exist
+        prevInputId?.let { id ->
+            inputDevices.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let {
+                binding.inputSpinner.setSelection(it)
+            }
+        }
+        prevOutputId?.let { id ->
+            outputDevices.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let {
+                binding.outputSpinner.setSelection(it)
+            }
+        }
+    }
+
     private fun deviceLabel(device: AudioDeviceInfo): String {
         val typeName = when (device.type) {
             AudioDeviceInfo.TYPE_BUILTIN_MIC      -> "Microfono"
@@ -107,6 +186,9 @@ class DailyScreenManager(
             AudioDeviceInfo.TYPE_WIRED_HEADSET    -> "Auricolari cablati"
             AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Cuffie cablate"
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO    -> "Bluetooth SCO"
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP   -> "Bluetooth A2DP"
+            AudioDeviceInfo.TYPE_BLE_HEADSET      -> "BLE Headset"
+            AudioDeviceInfo.TYPE_BLE_SPEAKER      -> "BLE Speaker"
             AudioDeviceInfo.TYPE_USB_DEVICE       -> "USB"
             AudioDeviceInfo.TYPE_USB_HEADSET      -> "Cuffie USB"
             else                                  -> "Dispositivo ${device.id}"
@@ -144,6 +226,7 @@ class DailyScreenManager(
     private fun doStart(inputItem: AudioDeviceItem, outputItem: AudioDeviceItem) {
         val ok = onStartRecording(inputItem.id, outputItem.id)
         if (!ok) return
+        AudioService.show(context)
         state = State.RECORDING
         setSpinnersEnabled(false)
         updateUi()
@@ -154,25 +237,41 @@ class DailyScreenManager(
 
     private fun activateScoAndStart(inputItem: AudioDeviceItem, outputItem: AudioDeviceItem) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        scoReceiver?.let { context.unregisterReceiver(it) }
+
+        // Save current mode and switch to COMMUNICATION — required for SCO routing
+        previousAudioMode = audioManager.mode
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+
+        cleanupSco()
+
         scoReceiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
                 val scoState = intent.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
                 when (scoState) {
                     AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
-                        ctx.unregisterReceiver(this)
-                        scoReceiver = null
+                        cancelScoTimeout()
+                        cleanupScoReceiver()
                         doStart(inputItem, outputItem)
                     }
                     AudioManager.SCO_AUDIO_STATE_ERROR -> {
-                        ctx.unregisterReceiver(this)
-                        scoReceiver = null
+                        cancelScoTimeout()
+                        cleanupScoReceiver()
+                        audioManager.mode = previousAudioMode
                         Toast.makeText(ctx, "Connessione Bluetooth SCO fallita", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
         }
         context.registerReceiver(scoReceiver, IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED))
+
+        // Timeout in case SCO never connects
+        scoTimeoutRunnable = Runnable {
+            cleanupSco()
+            audioManager.mode = previousAudioMode
+            Toast.makeText(context, "Timeout connessione Bluetooth SCO", Toast.LENGTH_SHORT).show()
+        }
+        handler.postDelayed(scoTimeoutRunnable!!, SCO_TIMEOUT_MS)
+
         @Suppress("DEPRECATION")
         audioManager.startBluetoothSco()
     }
@@ -180,15 +279,35 @@ class DailyScreenManager(
     private fun stopRecording() {
         onStopRecording()
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        scoReceiver?.let { context.unregisterReceiver(it); scoReceiver = null }
-        @Suppress("DEPRECATION")
-        audioManager.stopBluetoothSco()
+        cleanupSco()
+        // Restore audio mode
+        audioManager.mode = previousAudioMode
         state = State.IDLE
         setSpinnersEnabled(true)
         stopTimer()
         stopPulse()
         binding.waveformView.setActive(false)
         updateUi()
+    }
+
+    private fun cleanupSco() {
+        cancelScoTimeout()
+        cleanupScoReceiver()
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        @Suppress("DEPRECATION")
+        audioManager.stopBluetoothSco()
+    }
+
+    private fun cleanupScoReceiver() {
+        scoReceiver?.let {
+            try { context.unregisterReceiver(it) } catch (_: Exception) {}
+            scoReceiver = null
+        }
+    }
+
+    private fun cancelScoTimeout() {
+        scoTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        scoTimeoutRunnable = null
     }
 
     private fun setSpinnersEnabled(enabled: Boolean) {
@@ -305,7 +424,24 @@ class DailyScreenManager(
         if (state == State.IDLE) startRecording()
     }
 
+    fun onStart() {
+        registerDeviceCallbacks()
+    }
+
     fun onStop() {
-        if (state == State.RECORDING) stopRecording()
+        unregisterDeviceCallbacks()
+    }
+
+    fun syncToIdle() {
+        if (state != State.RECORDING) return
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        cleanupSco()
+        audioManager.mode = previousAudioMode
+        state = State.IDLE
+        setSpinnersEnabled(true)
+        stopTimer()
+        stopPulse()
+        binding.waveformView.setActive(false)
+        updateUi()
     }
 }

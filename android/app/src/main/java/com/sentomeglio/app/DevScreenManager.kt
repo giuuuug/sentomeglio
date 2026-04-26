@@ -1,9 +1,11 @@
 package com.sentomeglio.app
 
+import android.bluetooth.BluetoothAdapter
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Handler
@@ -32,21 +34,26 @@ class DevScreenManager(
     }
 
     companion object {
-        private val LOW_LATENCY_INPUT_TYPES = setOf(
+        private val SUPPORTED_INPUT_TYPES = setOf(
             AudioDeviceInfo.TYPE_BUILTIN_MIC,
             AudioDeviceInfo.TYPE_WIRED_HEADSET,
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
             AudioDeviceInfo.TYPE_USB_DEVICE,
-            AudioDeviceInfo.TYPE_USB_HEADSET
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_HEADSET
         )
-        private val LOW_LATENCY_OUTPUT_TYPES = setOf(
+        private val SUPPORTED_OUTPUT_TYPES = setOf(
             AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
             AudioDeviceInfo.TYPE_WIRED_HEADSET,
             AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
             AudioDeviceInfo.TYPE_USB_DEVICE,
-            AudioDeviceInfo.TYPE_USB_HEADSET
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_SPEAKER
         )
+        private const val SCO_TIMEOUT_MS = 8000L
     }
 
     private val context: Context get() = binding.root.context
@@ -56,12 +63,15 @@ class DevScreenManager(
     private val outputDevices = mutableListOf<AudioDeviceItem>()
     private val onnxModels = mutableListOf<String>()
     private var scoReceiver: BroadcastReceiver? = null
+    private var scoTimeoutRunnable: Runnable? = null
+    private var previousAudioMode: Int = AudioManager.MODE_NORMAL
 
     var isPlaying = false
         private set
 
     private var currentModelPath = ""
     private var currentNFft = 512
+    private var currentHopLength = 128
 
     private val consoleLines = ArrayDeque<String>()
     private val maxConsoleLines = 150
@@ -77,6 +87,9 @@ class DevScreenManager(
                     "HW: %.1f ms  |  DSP: %.2f ms  |  Infer: %.2f ms",
                     hwMs, dspMs, inferMs
                 )
+                val frameBudgetMs = currentHopLength * 1000.0 / 16000.0
+                val rtf = (dspMs + inferMs) / frameBudgetMs
+                binding.metricsText.text = String.format("RTF: %.3f", rtf)
                 val numFreqs = currentNFft / 2 + 1
                 val noisyArray = FloatArray(numFreqs)
                 val denArray = FloatArray(numFreqs)
@@ -88,14 +101,66 @@ class DevScreenManager(
         }
     }
 
+    // ── Dynamic device detection ─────────────────────────────────────────────
+
+    private val audioDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+            handler.post { refreshDeviceLists() }
+        }
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+            handler.post {
+                refreshDeviceLists()
+                if (isPlaying) {
+                    val currentInputId = (binding.inputSpinner.selectedItem as? AudioDeviceItem)?.id
+                    val currentOutputId = (binding.outputSpinner.selectedItem as? AudioDeviceItem)?.id
+                    if (currentInputId != null && inputDevices.none { it.id == currentInputId } ||
+                        currentOutputId != null && outputDevices.none { it.id == currentOutputId }) {
+                        stopAudio()
+                        log("WARN: dispositivo disconnesso, engine fermato")
+                        Toast.makeText(context, "Dispositivo audio disconnesso", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
+
+    private val bluetoothReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            when (intent.action) {
+                BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED,
+                "android.bluetooth.headset.profile.action.CONNECTION_STATE_CHANGED" -> {
+                    handler.postDelayed({ refreshDeviceLists() }, 500)
+                }
+            }
+        }
+    }
+
     init {
         binding.consoleScroll.setOnTouchListener { v, _ ->
             v.parent.requestDisallowInterceptTouchEvent(true)
             false
         }
         populateDeviceLists()
+        registerDeviceCallbacks()
         populateModelSpinner()
         setupRecButton()
+    }
+
+    private fun registerDeviceCallbacks() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.registerAudioDeviceCallback(audioDeviceCallback, handler)
+
+        val btFilter = IntentFilter().apply {
+            addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
+            addAction("android.bluetooth.headset.profile.action.CONNECTION_STATE_CHANGED")
+        }
+        context.registerReceiver(bluetoothReceiver, btFilter)
+    }
+
+    private fun unregisterDeviceCallbacks() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+        try { context.unregisterReceiver(bluetoothReceiver) } catch (_: Exception) {}
     }
 
     // ── Model spinner ────────────────────────────────────────────────────────
@@ -152,19 +217,15 @@ class DevScreenManager(
         inputDevices.clear()
         outputDevices.clear()
 
-        val seenInputTypes = mutableSetOf<Int>()
         for (device in audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
-            if (device.type !in LOW_LATENCY_INPUT_TYPES) continue
-            if (!seenInputTypes.add(device.type)) continue
+            if (device.type !in SUPPORTED_INPUT_TYPES) continue
             val typeStr = deviceTypeStr(device.type)
             val name = device.productName.toString().takeIf { it.isNotBlank() && it != "null" } ?: typeStr
             inputDevices.add(AudioDeviceItem("$name ($typeStr)", device.id, device.type))
         }
 
-        val seenOutputTypes = mutableSetOf<Int>()
         for (device in audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-            if (device.type !in LOW_LATENCY_OUTPUT_TYPES) continue
-            if (!seenOutputTypes.add(device.type)) continue
+            if (device.type !in SUPPORTED_OUTPUT_TYPES) continue
             val typeStr = deviceTypeStr(device.type)
             val name = device.productName.toString().takeIf { it.isNotBlank() && it != "null" } ?: typeStr
             outputDevices.add(AudioDeviceItem("$name ($typeStr)", device.id, device.type))
@@ -179,12 +240,35 @@ class DevScreenManager(
         binding.outputSpinner.adapter = outAdapter
     }
 
+    private fun refreshDeviceLists() {
+        val prevInputId = (binding.inputSpinner.selectedItem as? AudioDeviceItem)?.id
+        val prevOutputId = (binding.outputSpinner.selectedItem as? AudioDeviceItem)?.id
+
+        populateDeviceLists()
+
+        prevInputId?.let { id ->
+            inputDevices.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let {
+                binding.inputSpinner.setSelection(it)
+            }
+        }
+        prevOutputId?.let { id ->
+            outputDevices.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let {
+                binding.outputSpinner.setSelection(it)
+            }
+        }
+
+        log("Dispositivi aggiornati: ${inputDevices.size} in / ${outputDevices.size} out")
+    }
+
     private fun deviceTypeStr(type: Int) = when (type) {
         AudioDeviceInfo.TYPE_BUILTIN_MIC      -> "Built-in Mic"
         AudioDeviceInfo.TYPE_BUILTIN_SPEAKER  -> "Built-in Speaker"
         AudioDeviceInfo.TYPE_WIRED_HEADSET    -> "Wired Headset"
         AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired Headphones"
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO    -> "Bluetooth SCO"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP   -> "Bluetooth A2DP"
+        AudioDeviceInfo.TYPE_BLE_HEADSET      -> "BLE Headset"
+        AudioDeviceInfo.TYPE_BLE_SPEAKER      -> "BLE Speaker"
         AudioDeviceInfo.TYPE_USB_DEVICE       -> "USB Device"
         AudioDeviceInfo.TYPE_USB_HEADSET      -> "USB Headset"
         else                                  -> "Type $type"
@@ -210,6 +294,7 @@ class DevScreenManager(
                 return
             }
             currentNFft = nFft
+            currentHopLength = hopLength
             binding.specIn.init(currentNFft)
             binding.specDen.init(currentNFft)
 
@@ -221,31 +306,7 @@ class DevScreenManager(
             val needsSco = inputItem.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                            outputItem.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             if (needsSco) {
-                val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                scoReceiver?.let { context.unregisterReceiver(it) }
-                scoReceiver = object : BroadcastReceiver() {
-                    override fun onReceive(ctx: Context, intent: Intent) {
-                        val scoState = intent.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
-                        when (scoState) {
-                            AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
-                                ctx.unregisterReceiver(this)
-                                scoReceiver = null
-                                log("SCO connesso")
-                                doStartEngine(inputItem, outputItem, nFft, hopLength, winLength)
-                            }
-                            AudioManager.SCO_AUDIO_STATE_ERROR -> {
-                                ctx.unregisterReceiver(this)
-                                scoReceiver = null
-                                log("ERRORE: connessione SCO fallita")
-                                Toast.makeText(ctx, "Connessione Bluetooth SCO fallita", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    }
-                }
-                context.registerReceiver(scoReceiver, IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED))
-                @Suppress("DEPRECATION")
-                audioManager.startBluetoothSco()
-                log("Attivazione SCO in corso...")
+                activateScoAndStart(inputItem, outputItem, nFft, hopLength, winLength)
             } else {
                 doStartEngine(inputItem, outputItem, nFft, hopLength, winLength)
             }
@@ -254,11 +315,57 @@ class DevScreenManager(
         }
     }
 
+    private fun activateScoAndStart(inputItem: AudioDeviceItem, outputItem: AudioDeviceItem, nFft: Int, hopLength: Int, winLength: Int) {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        // Save current mode and switch to COMMUNICATION — required for SCO routing
+        previousAudioMode = audioManager.mode
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+
+        cleanupSco()
+
+        scoReceiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                val scoState = intent.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
+                when (scoState) {
+                    AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
+                        cancelScoTimeout()
+                        cleanupScoReceiver()
+                        log("SCO connesso")
+                        doStartEngine(inputItem, outputItem, nFft, hopLength, winLength)
+                    }
+                    AudioManager.SCO_AUDIO_STATE_ERROR -> {
+                        cancelScoTimeout()
+                        cleanupScoReceiver()
+                        audioManager.mode = previousAudioMode
+                        log("ERRORE: connessione SCO fallita")
+                        Toast.makeText(ctx, "Connessione Bluetooth SCO fallita", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+        context.registerReceiver(scoReceiver, IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED))
+
+        // Timeout in case SCO never connects
+        scoTimeoutRunnable = Runnable {
+            cleanupSco()
+            audioManager.mode = previousAudioMode
+            log("ERRORE: timeout connessione SCO")
+            Toast.makeText(context, "Timeout connessione Bluetooth SCO", Toast.LENGTH_SHORT).show()
+        }
+        handler.postDelayed(scoTimeoutRunnable!!, SCO_TIMEOUT_MS)
+
+        @Suppress("DEPRECATION")
+        audioManager.startBluetoothSco()
+        log("Attivazione SCO in corso...")
+    }
+
     private fun doStartEngine(inputItem: AudioDeviceItem, outputItem: AudioDeviceItem, nFft: Int, hopLength: Int, winLength: Int) {
         val ok = NativeBridge.startAudioEngine(
             inputItem.id, outputItem.id, currentModelPath, nFft, hopLength, winLength
         )
         if (ok) {
+            AudioService.show(context)
             isPlaying = true
             setControlsEnabled(false)
             binding.recButton.setBackgroundResource(R.drawable.bg_rec_dev_recording)
@@ -268,6 +375,9 @@ class DevScreenManager(
             handler.post(uiUpdater)
             log("Engine avviato")
         } else {
+            // If SCO was activated, restore audio mode
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.mode = previousAudioMode
             log("ERRORE: engine non avviato")
             Toast.makeText(context, "Failed to start audio engine", Toast.LENGTH_SHORT).show()
         }
@@ -276,19 +386,40 @@ class DevScreenManager(
     fun stopAudio() {
         if (!isPlaying) return
         NativeBridge.stopAudioEngine()
+        AudioService.dismiss(context)
         isPlaying = false
         handler.removeCallbacks(uiUpdater)
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        scoReceiver?.let { context.unregisterReceiver(it); scoReceiver = null }
-        @Suppress("DEPRECATION")
-        audioManager.stopBluetoothSco()
+        cleanupSco()
+        audioManager.mode = previousAudioMode
         setControlsEnabled(true)
         binding.recButton.setBackgroundResource(R.drawable.bg_rec_dev_idle)
         binding.recButton.text = "REC"
         binding.recButton.setTextColor(ContextCompat.getColor(context, R.color.colorPrimary))
         binding.statusText.text = "Ready"
         binding.latencyText.text = "HW: N/A  |  DSP: N/A  |  Infer: N/A"
+        binding.metricsText.text = "RTF: N/A"
         log("Engine fermato")
+    }
+
+    private fun cleanupSco() {
+        cancelScoTimeout()
+        cleanupScoReceiver()
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        @Suppress("DEPRECATION")
+        audioManager.stopBluetoothSco()
+    }
+
+    private fun cleanupScoReceiver() {
+        scoReceiver?.let {
+            try { context.unregisterReceiver(it) } catch (_: Exception) {}
+            scoReceiver = null
+        }
+    }
+
+    private fun cancelScoTimeout() {
+        scoTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        scoTimeoutRunnable = null
     }
 
     private fun setControlsEnabled(enabled: Boolean) {
@@ -315,7 +446,27 @@ class DevScreenManager(
         }
     }
 
+    fun onStart() {
+        registerDeviceCallbacks()
+    }
+
     fun onStop() {
-        if (isPlaying) stopAudio()
+        unregisterDeviceCallbacks()
+    }
+
+    fun syncToIdle() {
+        if (!isPlaying) return
+        isPlaying = false
+        handler.removeCallbacks(uiUpdater)
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        cleanupSco()
+        audioManager.mode = previousAudioMode
+        setControlsEnabled(true)
+        binding.recButton.setBackgroundResource(R.drawable.bg_rec_dev_idle)
+        binding.recButton.text = "REC"
+        binding.recButton.setTextColor(ContextCompat.getColor(context, R.color.colorPrimary))
+        binding.statusText.text = "Ready"
+        binding.latencyText.text = "HW: N/A  |  DSP: N/A  |  Infer: N/A"
+        binding.metricsText.text = "RTF: N/A"
     }
 }
