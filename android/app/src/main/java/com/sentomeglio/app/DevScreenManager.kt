@@ -26,6 +26,7 @@ import java.util.Locale
 
 class DevScreenManager(
     private val binding: LayoutDevBinding,
+    private val onEnsurePermissions: () -> Boolean,
     private val onSettingsRequested: () -> Unit
 ) {
 
@@ -72,6 +73,11 @@ class DevScreenManager(
     private var currentModelPath = ""
     private var currentNFft = 512
     private var currentHopLength = 128
+    private var currentWinLength = 320
+
+    private val defaultNFft = 512
+    private val defaultHopLength = 128
+    private val defaultWinLength = 320
 
     private val consoleLines = ArrayDeque<String>()
     private val maxConsoleLines = 150
@@ -283,18 +289,23 @@ class DevScreenManager(
     }
 
     fun startAudio() {
+        if (!onEnsurePermissions()) {
+            log("INFO: permessi mancanti, richiesta in corso")
+            return
+        }
         val inputItem = binding.inputSpinner.selectedItem as? AudioDeviceItem ?: return
         val outputItem = binding.outputSpinner.selectedItem as? AudioDeviceItem ?: return
         try {
-            val nFft = binding.nFftInput.text.toString().toInt()
-            val hopLength = binding.hopLengthInput.text.toString().toInt()
-            val winLength = binding.winLengthInput.text.toString().toInt()
+            val nFft = binding.nFftInput.text.toString().toIntOrNull() ?: defaultNFft
+            val hopLength = binding.hopLengthInput.text.toString().toIntOrNull() ?: defaultHopLength
+            val winLength = binding.winLengthInput.text.toString().toIntOrNull() ?: defaultWinLength
             if (nFft < winLength || hopLength > winLength) {
                 Toast.makeText(context, "Parametri STFT non validi", Toast.LENGTH_LONG).show()
                 return
             }
             currentNFft = nFft
             currentHopLength = hopLength
+            currentWinLength = winLength
             binding.specIn.init(currentNFft)
             binding.specDen.init(currentNFft)
 
@@ -310,9 +321,16 @@ class DevScreenManager(
             } else {
                 doStartEngine(inputItem, outputItem, nFft, hopLength, winLength)
             }
-        } catch (e: NumberFormatException) {
-            Toast.makeText(context, "Valori STFT devono essere numeri interi", Toast.LENGTH_SHORT).show()
+        } catch (_: NumberFormatException) {
+            Toast.makeText(context, "Valori STFT non validi, uso default", Toast.LENGTH_SHORT).show()
+            binding.nFftInput.setText(defaultNFft.toString())
+            binding.hopLengthInput.setText(defaultHopLength.toString())
+            binding.winLengthInput.setText(defaultWinLength.toString())
         }
+    }
+
+    fun retryStartAudio() {
+        if (!isPlaying) startAudio()
     }
 
     private fun activateScoAndStart(inputItem: AudioDeviceItem, outputItem: AudioDeviceItem, nFft: Int, hopLength: Int, winLength: Int) {

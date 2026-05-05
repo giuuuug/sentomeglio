@@ -53,6 +53,7 @@ class MainActivity : AppCompatActivity() {
 
         devManager = DevScreenManager(
             binding = binding.screenDev,
+            onEnsurePermissions = { checkPermissions() },
             onSettingsRequested = { openSettings() }
         )
 
@@ -63,6 +64,7 @@ class MainActivity : AppCompatActivity() {
         super.onStart()
         dailyManager.onStart()
         devManager.onStart()
+        checkPermissions()
     }
 
     override fun onResume() {
@@ -121,7 +123,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadDefaultModel(): String? {
-        val modelName = assets.list("")?.firstOrNull { it.endsWith(".onnx") } ?: return null
+        val modelName = assets.list("")?.find { it == "High.onnx" } ?: return null
         val outFile = File(cacheDir, modelName)
         return try {
             assets.open(modelName).use { input ->
@@ -139,6 +141,9 @@ class MainActivity : AppCompatActivity() {
         val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
         val missing = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
@@ -158,9 +163,13 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == PERMISSIONS_REQUEST_CODE) {
             if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-                dailyManager.retryStartRecording()
+                if (prefs.devMode) {
+                    devManager.retryStartAudio()
+                } else {
+                    dailyManager.retryStartRecording()
+                }
             } else {
-                Toast.makeText(this, "Permesso microfono necessario", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Permessi necessari per microfono/notifiche", Toast.LENGTH_SHORT).show()
             }
         }
     }

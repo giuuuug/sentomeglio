@@ -9,13 +9,15 @@
 #include <mutex>
 #include <onnxruntime_cxx_api.h>
 
-class StreamingOnnxEnhancer {
+class StreamingOnnxEnhancer
+{
 public:
-    StreamingOnnxEnhancer(const std::string& modelPath, int sampleRate, int nFft, int hopLength, int winLength);
+    StreamingOnnxEnhancer(const std::string &modelPath, int sampleRate, int nFft, int hopLength, int winLength);
     ~StreamingOnnxEnhancer();
 
-    void processHop(const float* input, float* output);
-    void getMagnitudesDb(std::vector<float>& noisyDb, std::vector<float>& denDb);
+    void processHop(const float *input, float *output);
+    void getMagnitudesDb(std::vector<float> &noisyDb, std::vector<float> &denDb);
+    void prewarm();
 
     int getHopLength() const { return mHopLength; }
     double getInferenceLatencyMs() const { return mInferenceEmaMs.load(); }
@@ -47,8 +49,8 @@ private:
     std::vector<float> mOlaSignal;
     std::vector<float> mOlaNorm;
 
-    std::vector<const char*> mInputNames;
-    std::vector<const char*> mOutputNames;
+    std::vector<const char *> mInputNames;
+    std::vector<const char *> mOutputNames;
     std::vector<std::string> mInputNamesStr;
     std::vector<std::string> mOutputNamesStr;
 

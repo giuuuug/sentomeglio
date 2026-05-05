@@ -81,7 +81,6 @@ class DailyScreenManager(
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
             handler.post {
                 refreshDeviceLists()
-                // If we are recording and a selected device was removed, stop
                 if (state == State.RECORDING) {
                     val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                     val currentInputId = (binding.inputSpinner.selectedItem as? AudioDeviceItem)?.id
