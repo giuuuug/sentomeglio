@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+  <!-- Background gradient -->
+  <path
+      android:pathData="M0,0h108v108h-108z"
+      android:fillColor="#1e88e5" />
+
+  <!-- Microphone capsule (head) -->
+  <path
+      android:pathData="M54,28C63.94,28 72,36.06 72,46L72,76C72,85.94 63.94,94 54,94C44.06,94 36,85.94 36,76L36,46C36,36.06 44.06,28 54,28Z"
+      android:fillColor="#64b5f6" />
+
+  <!-- Microphone stand -->
+  <path
+      android:pathData="M48,94L48,108C48,111.31 50.69,114 54,114C57.31,114 60,111.31 60,108L60,94Z"
+      android:fillColor="#64b5f6" />
+
+  <!-- Sound wave - outer circle -->
+  <path
+      android:pathData="M54,50C65.05,50 74,58.95 74,70"
+      android:strokeWidth="2.5"
+      android:strokeColor="#ffffff"
+      android:strokeLineCap="round"
+      android:fillColor="@android:color/transparent"
+      android:strokeAlpha="0.6" />
+
+  <!-- Sound wave - inner circle (enhanced audio) -->
+  <path
+      android:pathData="M54,64C62.84,64 70,71.16 70,80C70,88.84 62.84,96 54,96C45.16,96 38,88.84 38,80C38,71.16 45.16,64 54,64Z"
+      android:strokeWidth="2"
+      android:strokeColor="#ffffff"
+      android:fillColor="@android:color/transparent" />
+
+  <!-- Checkmark (improvement indicator) -->
+  <path
+      android:pathData="M42,80L50,88L66,70"
+      android:strokeWidth="3.5"
+      android:strokeColor="#ffffff"
+      android:strokeLineCap="round"
+      android:strokeLineJoin="round"
+      android:fillColor="@android:color/transparent" />
+</vector>

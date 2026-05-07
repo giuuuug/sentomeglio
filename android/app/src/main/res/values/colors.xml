@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Background & surfaces -->
+    <color name="colorBg">#faf8f8</color>
+    <color name="colorSurface">#ffffff</color>
+    <color name="colorSurfaceEl">#f2eeee</color>
+    <color name="colorBorder">#e0d8d8</color>
+
+    <!-- Primary — Rose -->
+    <color name="colorPrimary">#e8445a</color>
+    <color name="colorPrimaryDim">#c93349</color>
+    <color name="colorPrimaryBg">#14e8445a</color>
+
+    <!-- Text -->
+    <color name="colorOnSurface">#1a1214</color>
+    <color name="colorOnSurfaceVar">#7a6468</color>
+
+    <!-- Status -->
+    <color name="colorError">#c93349</color>
+    <color name="colorErrorBg">#1ac93349</color>
+    <color name="colorWarn">#d97b00</color>
+    <color name="colorCodeGreen">#2e7d52</color>
+    <color name="colorCodeCyan">#1a6b8a</color>
+
+    <!-- Console -->
+    <color name="colorConsoleBg">#fdf8f8</color>
+
+    <!-- Legacy aliases kept for system uses -->
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Background & surfaces (dark) -->
+    <color name="colorBg">#111011</color>
+    <color name="colorSurface">#1e1b1c</color>
+    <color name="colorSurfaceEl">#2a2526</color>
+    <color name="colorBorder">#3a3234</color>
+
+    <!-- Text (light on dark) -->
+    <color name="colorOnSurface">#f0eaeb</color>
+    <color name="colorOnSurfaceVar">#9e8e91</color>
+
+    <!-- Console -->
+    <color name="colorConsoleBg">#1a1718</color>
+</resources>

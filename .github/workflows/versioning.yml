@@ -1,0 +1,54 @@
+name: Auto Versioning
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/release-please-action@v4
+        id: release
+        with:
+          release-type: simple
+          package-name: sentomeglio
+
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.release_created }}
+
+      - name: Update build.gradle.kts with new version
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          VERSION_NAME="${{ steps.release.outputs.tag_name }}"
+          VERSION_NAME=${VERSION_NAME#v}
+          VERSION_CODE=${{ steps.release.outputs.version }}
+
+          # Sostituisci versionName e versionCode nel build.gradle.kts
+          sed -i "s/versionName = \".*\"/versionName = \"${VERSION_NAME}\"/g" android/app/build.gradle.kts
+          sed -i "s/versionCode = [0-9]*/versionCode = ${GITHUB_RUN_NUMBER}/g" android/app/build.gradle.kts
+
+          # Mostra le modifiche
+          echo "Updated versions:"
+          grep -E "versionName|versionCode" android/app/build.gradle.kts
+
+      - name: Commit and push version update
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Actions"
+          git add android/app/build.gradle.kts
+          git commit -m "chore: update version in build.gradle.kts to ${{ steps.release.outputs.tag_name }}"
+          git push
+
+      - name: Display release info
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          echo "✅ Release created!"
+          echo "Version: ${{ steps.release.outputs.tag_name }}"
+          echo "Release notes: ${{ steps.release.outputs.body }}"
