@@ -88,6 +88,19 @@ Java_com_sentomeglio_app_NativeBridge_getSharingMode(JNIEnv *env, jobject)
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_sentomeglio_app_NativeBridge_setRecording(JNIEnv *env, jobject /* this */,
+                                                   jboolean enabled,
+                                                   jstring noisyPath,
+                                                   jstring denoisedPath)
+{
+  const char *nNoisy    = env->GetStringUTFChars(noisyPath,    0);
+  const char *nDenoised = env->GetStringUTFChars(denoisedPath, 0);
+  engine.setRecording(enabled == JNI_TRUE, std::string(nNoisy), std::string(nDenoised));
+  env->ReleaseStringUTFChars(noisyPath,    nNoisy);
+  env->ReleaseStringUTFChars(denoisedPath, nDenoised);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_sentomeglio_app_NativeBridge_getSpectrograms(JNIEnv *env,
                                                       jobject /* this */,
                                                       jfloatArray noisyArray,

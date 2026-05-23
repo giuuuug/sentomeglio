@@ -192,6 +192,41 @@
                     android:paddingEnd="12dp"
                     android:layout_marginBottom="16dp" />
 
+                <!-- Recording toggle -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="REGISTRAZIONE"
+                    android:textSize="11sp"
+                    android:textColor="@color/colorOnSurfaceVar"
+                    android:letterSpacing="0.08"
+                    android:fontFamily="sans-serif-medium"
+                    android:layout_marginBottom="6dp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="16dp">
+
+                    <Switch
+                        android:id="@+id/recordSwitch"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginEnd="10dp" />
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Salva file registrazione"
+                        android:textSize="12sp"
+                        android:fontFamily="monospace"
+                        android:textColor="@color/colorOnSurfaceVar" />
+
+                </LinearLayout>
+
                 <!-- REC/STOP button -->
                 <Button
                     android:id="@+id/recButton"

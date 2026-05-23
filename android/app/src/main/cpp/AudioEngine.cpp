@@ -2,12 +2,49 @@
 #include <algorithm>
 #include <android/log.h>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <sys/resource.h>
 
 #define TAG "AudioEngine"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+
+// ── WAV helpers ───────────────────────────────────────────────────────────────
+
+static void writeWavPlaceholderHeader(FILE *f, int sampleRate)
+{
+    // 44-byte PCM WAV header with data size = 0 (filled in at close)
+    const int16_t audioFormat  = 1;  // PCM
+    const int16_t numChannels  = 1;
+    const int32_t byteRate     = sampleRate * 2;
+    const int16_t blockAlign   = 2;
+    const int16_t bitsPerSample= 16;
+    const int32_t subchunk1Size= 16;
+    const int32_t dataSize     = 0;
+    const int32_t chunkSize    = 36 + dataSize;
+
+    fwrite("RIFF", 1, 4, f);      fwrite(&chunkSize,     4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);      fwrite(&subchunk1Size, 4, 1, f);
+    fwrite(&audioFormat,  2, 1, f);
+    fwrite(&numChannels,  2, 1, f);
+    fwrite(&sampleRate,   4, 1, f);
+    fwrite(&byteRate,     4, 1, f);
+    fwrite(&blockAlign,   2, 1, f);
+    fwrite(&bitsPerSample,2, 1, f);
+    fwrite("data", 1, 4, f);      fwrite(&dataSize, 4, 1, f);
+}
+
+static void finalizeWavHeader(FILE *f, int32_t numSamples)
+{
+    int32_t dataBytes  = numSamples * 2;
+    int32_t chunkSize  = 36 + dataBytes;
+    fseek(f, 4,  SEEK_SET); fwrite(&chunkSize,  4, 1, f);
+    fseek(f, 40, SEEK_SET); fwrite(&dataBytes,  4, 1, f);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 AudioEngine::AudioEngine() {}
 AudioEngine::~AudioEngine() { stop(); }
@@ -33,6 +70,12 @@ bool AudioEngine::start(int inputDeviceId, int outputDeviceId,
     // first hops arrive from the callback.
     mInferenceRunning.store(true, std::memory_order_relaxed);
     mInferenceThread = std::thread(&AudioEngine::inferenceLoop, this);
+
+    if (mRecordingEnabled.load(std::memory_order_relaxed))
+    {
+        mRecorderRunning.store(true, std::memory_order_relaxed);
+        mRecorderThread = std::thread(&AudioEngine::recorderLoop, this);
+    }
 
     oboe::Result result = mRecordingStream->requestStart();
     if (result != oboe::Result::OK)
@@ -62,6 +105,14 @@ bool AudioEngine::start(int inputDeviceId, int outputDeviceId,
     return true;
 }
 
+void AudioEngine::setRecording(bool enabled, const std::string &noisyPath,
+                               const std::string &denoisedPath)
+{
+    mRecordingEnabled.store(enabled, std::memory_order_relaxed);
+    mNoisyWavPath    = noisyPath;
+    mDenoisedWavPath = denoisedPath;
+}
+
 void AudioEngine::stop()
 {
     // Stop streams
@@ -70,9 +121,12 @@ void AudioEngine::stop()
     // Signal inference thread to exit and wait for it.
     mInferenceRunning.store(false, std::memory_order_relaxed);
     if (mInferenceThread.joinable())
-    {
         mInferenceThread.join();
-    }
+
+    // Signal recorder thread to drain remaining data and exit.
+    mRecorderRunning.store(false, std::memory_order_relaxed);
+    if (mRecorderThread.joinable())
+        mRecorderThread.join();
 
     mEnhancer.reset();
 }
@@ -270,6 +324,19 @@ bool AudioEngine::openStreams(int inputDeviceId, int outputDeviceId, int hopLeng
     int maxUpsampled = (hopLength * mHwRate / mAiRate) + 4;
     mUpsampledBuffer.resize(maxUpsampled);
 
+    // Recording FIFOs: 3 s @ 16 kHz = 48000 samples each
+    mRecordNoisyCapacity = 48000;
+    mRecordNoisyFifo.assign(mRecordNoisyCapacity, 0.f);
+    mRecordNoisyReadIdx = 0;
+    mRecordNoisyWriteIdx = 0;
+    mRecordNoisyCount.store(0, std::memory_order_relaxed);
+
+    mRecordDenoisedCapacity = 48000;
+    mRecordDenoisedFifo.assign(mRecordDenoisedCapacity, 0.f);
+    mRecordDenoisedReadIdx = 0;
+    mRecordDenoisedWriteIdx = 0;
+    mRecordDenoisedCount.store(0, std::memory_order_relaxed);
+
     return true;
 }
 
@@ -353,6 +420,139 @@ int AudioEngine::inputFifoRead(float *data, int count)
     return n;
 }
 
+// ── Recording FIFO helpers ────────────────────────────────────────────────────
+// recNoisyWrite: called from audio callback (producer)
+// recDenoisedWrite: called from inference thread (producer)
+// recNoisyRead / recDenoisedRead: called from recorder thread (consumer)
+
+void AudioEngine::recNoisyWrite(const float *data, int n)
+{
+    int space = mRecordNoisyCapacity - mRecordNoisyCount.load(std::memory_order_acquire);
+    n = std::min(n, space);
+    for (int i = 0; i < n; ++i)
+    {
+        mRecordNoisyFifo[mRecordNoisyWriteIdx] = data[i];
+        if (++mRecordNoisyWriteIdx == mRecordNoisyCapacity)
+            mRecordNoisyWriteIdx = 0;
+    }
+    if (n > 0)
+        mRecordNoisyCount.fetch_add(n, std::memory_order_release);
+}
+
+int AudioEngine::recNoisyRead(float *buf, int n)
+{
+    int avail = mRecordNoisyCount.load(std::memory_order_acquire);
+    n = std::min(n, avail);
+    for (int i = 0; i < n; ++i)
+    {
+        buf[i] = mRecordNoisyFifo[mRecordNoisyReadIdx];
+        if (++mRecordNoisyReadIdx == mRecordNoisyCapacity)
+            mRecordNoisyReadIdx = 0;
+    }
+    if (n > 0)
+        mRecordNoisyCount.fetch_sub(n, std::memory_order_release);
+    return n;
+}
+
+void AudioEngine::recDenoisedWrite(const float *data, int n)
+{
+    int space = mRecordDenoisedCapacity - mRecordDenoisedCount.load(std::memory_order_acquire);
+    n = std::min(n, space);
+    for (int i = 0; i < n; ++i)
+    {
+        mRecordDenoisedFifo[mRecordDenoisedWriteIdx] = data[i];
+        if (++mRecordDenoisedWriteIdx == mRecordDenoisedCapacity)
+            mRecordDenoisedWriteIdx = 0;
+    }
+    if (n > 0)
+        mRecordDenoisedCount.fetch_add(n, std::memory_order_release);
+}
+
+int AudioEngine::recDenoisedRead(float *buf, int n)
+{
+    int avail = mRecordDenoisedCount.load(std::memory_order_acquire);
+    n = std::min(n, avail);
+    for (int i = 0; i < n; ++i)
+    {
+        buf[i] = mRecordDenoisedFifo[mRecordDenoisedReadIdx];
+        if (++mRecordDenoisedReadIdx == mRecordDenoisedCapacity)
+            mRecordDenoisedReadIdx = 0;
+    }
+    if (n > 0)
+        mRecordDenoisedCount.fetch_sub(n, std::memory_order_release);
+    return n;
+}
+
+// ── Recorder thread ───────────────────────────────────────────────────────────
+
+void AudioEngine::recorderLoop()
+{
+    FILE *fNoisy    = fopen(mNoisyWavPath.c_str(),    "wb");
+    FILE *fDenoised = fopen(mDenoisedWavPath.c_str(), "wb");
+
+    if (!fNoisy || !fDenoised)
+    {
+        LOGE("recorderLoop: cannot open WAV files");
+        if (fNoisy)    fclose(fNoisy);
+        if (fDenoised) fclose(fDenoised);
+        return;
+    }
+
+    writeWavPlaceholderHeader(fNoisy,    mAiRate);
+    writeWavPlaceholderHeader(fDenoised, mAiRate);
+
+    // Scratch buffer — local, no dynamic allocation in the loop
+    static const int kBufSize = 4096;
+    float   fbuf[kBufSize];
+    int16_t ibuf[kBufSize];
+
+    int32_t noisySamples    = 0;
+    int32_t denoisedSamples = 0;
+
+    while (mRecorderRunning.load(std::memory_order_relaxed) ||
+           mRecordNoisyCount.load(std::memory_order_acquire) > 0 ||
+           mRecordDenoisedCount.load(std::memory_order_acquire) > 0)
+    {
+        // Drain noisy FIFO
+        int n = recNoisyRead(fbuf, kBufSize);
+        for (int i = 0; i < n; ++i)
+        {
+            float s = fbuf[i];
+            if (s >  1.f) s =  1.f;
+            if (s < -1.f) s = -1.f;
+            ibuf[i] = static_cast<int16_t>(s * 32767.f);
+        }
+        if (n > 0)
+        {
+            fwrite(ibuf, sizeof(int16_t), n, fNoisy);
+            noisySamples += n;
+        }
+
+        // Drain denoised FIFO
+        n = recDenoisedRead(fbuf, kBufSize);
+        for (int i = 0; i < n; ++i)
+        {
+            float s = fbuf[i];
+            if (s >  1.f) s =  1.f;
+            if (s < -1.f) s = -1.f;
+            ibuf[i] = static_cast<int16_t>(s * 32767.f);
+        }
+        if (n > 0)
+        {
+            fwrite(ibuf, sizeof(int16_t), n, fDenoised);
+            denoisedSamples += n;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    finalizeWavHeader(fNoisy,    noisySamples);
+    finalizeWavHeader(fDenoised, denoisedSamples);
+    fclose(fNoisy);
+    fclose(fDenoised);
+    LOGD("Recorder done: noisy=%d samples, denoised=%d samples", noisySamples, denoisedSamples);
+}
+
 // ── Inference thread ──────────────────────────────────────────────────────────
 
 void AudioEngine::inferenceLoop()
@@ -379,6 +579,9 @@ void AudioEngine::inferenceLoop()
         {
             std::memcpy(mModelOutputBuffer.data(), mModelInputBuffer.data(), mHopLength * sizeof(float));
         }
+
+        if (mRecordingEnabled.load(std::memory_order_relaxed))
+            recDenoisedWrite(mModelOutputBuffer.data(), mHopLength);
 
         // Upsample back to HW rate if needed, then push to output FIFO.
         if (mUpsampler)
@@ -422,10 +625,14 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream * /*stream*
     {
         int n = mDownsampler->resample(mMicrophoneBuffer.data(), numFrames, mDownsampledBuffer.data());
         inputFifoWrite(mDownsampledBuffer.data(), n);
+        if (mRecordingEnabled.load(std::memory_order_relaxed))
+            recNoisyWrite(mDownsampledBuffer.data(), n);
     }
     else
     {
         inputFifoWrite(mMicrophoneBuffer.data(), numFrames);
+        if (mRecordingEnabled.load(std::memory_order_relaxed))
+            recNoisyWrite(mMicrophoneBuffer.data(), numFrames);
     }
 
     // Read processed audio from output FIFO.

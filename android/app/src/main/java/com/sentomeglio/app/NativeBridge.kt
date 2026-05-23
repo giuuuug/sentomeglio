@@ -24,4 +24,5 @@ object NativeBridge {
     external fun getSampleRateHz(): Int
     external fun getSharingMode(): Int          // 0 = Exclusive, 1 = Shared
     external fun getSpectrograms(noisyDb: FloatArray, denDb: FloatArray)
+    external fun setRecording(enabled: Boolean, noisyPath: String, denoisedPath: String)
 }

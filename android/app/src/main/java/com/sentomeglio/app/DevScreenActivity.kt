@@ -1,10 +1,12 @@
 package com.sentomeglio.app
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -12,6 +14,7 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.sentomeglio.app.databinding.ActivityDevBinding
 import java.io.File
 import java.io.FileOutputStream
@@ -40,6 +43,10 @@ class DevScreenActivity : BaseAudioActivity() {
     private val defaultNFft = 512
     private val defaultHopLength = 128
     private val defaultWinLength = 320
+
+    private var isRecordingToFile = false
+    private var noisyWavPath = ""
+    private var denoisedWavPath = ""
 
     private val consoleLines = ArrayDeque<String>()
     private val maxConsoleLines = 150
@@ -211,6 +218,22 @@ class DevScreenActivity : BaseAudioActivity() {
             log("Input : ${inputItem.name}")
             log("Output: ${outputItem.name}")
 
+            // Setup recording if requested
+            if (binding.content.recordSwitch.isChecked) {
+                val dir = getExternalFilesDir("SentoMeglio_Recordings")
+                    ?: File(filesDir, "SentoMeglio_Recordings")
+                dir.mkdirs()
+                val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                noisyWavPath    = "${dir.absolutePath}/noisy_$ts.wav"
+                denoisedWavPath = "${dir.absolutePath}/denoised_$ts.wav"
+                NativeBridge.setRecording(true, noisyWavPath, denoisedWavPath)
+                isRecordingToFile = true
+                log("REC → $noisyWavPath")
+            } else {
+                NativeBridge.setRecording(false, "", "")
+                isRecordingToFile = false
+            }
+
             val needsSco = inputItem.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                            outputItem.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             if (needsSco) {
@@ -261,6 +284,34 @@ class DevScreenActivity : BaseAudioActivity() {
         am.mode = previousAudioMode
         resetUi()
         log("Engine fermato")
+        if (isRecordingToFile) {
+            isRecordingToFile = false
+            showRecordingDoneDialog(noisyWavPath, denoisedWavPath)
+        }
+    }
+
+    private fun showRecordingDoneDialog(noisyPath: String, denoisedPath: String) {
+        val dir = File(noisyPath).parentFile ?: return
+        AlertDialog.Builder(this)
+            .setTitle("Registrazione completata")
+            .setMessage("noisy:\n$noisyPath\n\ndenoised:\n$denoisedPath")
+            .setPositiveButton("Apri cartella") { _, _ -> openRecordingsFolder(dir) }
+            .setNegativeButton("OK", null)
+            .show()
+    }
+
+    private fun openRecordingsFolder(dir: File) {
+        try {
+            val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", dir)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(Intent.createChooser(intent, "Apri con"))
+        } catch (e: Exception) {
+            log("WARN: impossibile aprire il file manager: ${e.message}")
+            Toast.makeText(this, "Percorso: ${dir.absolutePath}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun syncToIdle() {
@@ -293,6 +344,7 @@ class DevScreenActivity : BaseAudioActivity() {
         binding.content.nFftInput.isEnabled = enabled
         binding.content.hopLengthInput.isEnabled = enabled
         binding.content.winLengthInput.isEnabled = enabled
+        binding.content.recordSwitch.isEnabled = enabled
     }
 
     // ── Console ──────────────────────────────────────────────────────────────

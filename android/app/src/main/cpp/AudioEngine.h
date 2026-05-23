@@ -91,6 +91,40 @@ private:
     // AI FIFO helpers (callback = producer, inference = consumer)
     void inputFifoWrite(const float *data, int count);
     int inputFifoRead(float *data, int count);
+
+    // ── Recording ─────────────────────────────────────────────────────────────
+public:
+    void setRecording(bool enabled, const std::string &noisyPath, const std::string &denoisedPath);
+
+private:
+    std::atomic<bool> mRecordingEnabled{false};
+    std::string mNoisyWavPath;
+    std::string mDenoisedWavPath;
+
+    // SPSC FIFOs: audio callback → recorder thread (noisy)
+    //             inference thread → recorder thread (denoised)
+    std::vector<float> mRecordNoisyFifo;
+    int mRecordNoisyReadIdx = 0;
+    int mRecordNoisyWriteIdx = 0;
+    std::atomic<int> mRecordNoisyCount{0};
+    int mRecordNoisyCapacity = 0;
+
+    std::vector<float> mRecordDenoisedFifo;
+    int mRecordDenoisedReadIdx = 0;
+    int mRecordDenoisedWriteIdx = 0;
+    std::atomic<int> mRecordDenoisedCount{0};
+    int mRecordDenoisedCapacity = 0;
+
+    // Recorder thread
+    std::thread mRecorderThread;
+    std::atomic<bool> mRecorderRunning{false};
+    void recorderLoop();
+
+    // Recording FIFO helpers
+    void recNoisyWrite(const float *data, int n);
+    void recDenoisedWrite(const float *data, int n);
+    int  recNoisyRead(float *buf, int n);
+    int  recDenoisedRead(float *buf, int n);
 };
 
 #endif // AUDIOENGINE_H
