@@ -15,33 +15,38 @@
 static void writeWavPlaceholderHeader(FILE *f, int sampleRate)
 {
     // 44-byte PCM WAV header with data size = 0 (filled in at close)
-    const int16_t audioFormat  = 1;  // PCM
-    const int16_t numChannels  = 1;
-    const int32_t byteRate     = sampleRate * 2;
-    const int16_t blockAlign   = 2;
-    const int16_t bitsPerSample= 16;
-    const int32_t subchunk1Size= 16;
-    const int32_t dataSize     = 0;
-    const int32_t chunkSize    = 36 + dataSize;
+    const int16_t audioFormat = 1; // PCM
+    const int16_t numChannels = 1;
+    const int32_t byteRate = sampleRate * 2;
+    const int16_t blockAlign = 2;
+    const int16_t bitsPerSample = 16;
+    const int32_t subchunk1Size = 16;
+    const int32_t dataSize = 0;
+    const int32_t chunkSize = 36 + dataSize;
 
-    fwrite("RIFF", 1, 4, f);      fwrite(&chunkSize,     4, 1, f);
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&chunkSize, 4, 1, f);
     fwrite("WAVE", 1, 4, f);
-    fwrite("fmt ", 1, 4, f);      fwrite(&subchunk1Size, 4, 1, f);
-    fwrite(&audioFormat,  2, 1, f);
-    fwrite(&numChannels,  2, 1, f);
-    fwrite(&sampleRate,   4, 1, f);
-    fwrite(&byteRate,     4, 1, f);
-    fwrite(&blockAlign,   2, 1, f);
-    fwrite(&bitsPerSample,2, 1, f);
-    fwrite("data", 1, 4, f);      fwrite(&dataSize, 4, 1, f);
+    fwrite("fmt ", 1, 4, f);
+    fwrite(&subchunk1Size, 4, 1, f);
+    fwrite(&audioFormat, 2, 1, f);
+    fwrite(&numChannels, 2, 1, f);
+    fwrite(&sampleRate, 4, 1, f);
+    fwrite(&byteRate, 4, 1, f);
+    fwrite(&blockAlign, 2, 1, f);
+    fwrite(&bitsPerSample, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&dataSize, 4, 1, f);
 }
 
 static void finalizeWavHeader(FILE *f, int32_t numSamples)
 {
-    int32_t dataBytes  = numSamples * 2;
-    int32_t chunkSize  = 36 + dataBytes;
-    fseek(f, 4,  SEEK_SET); fwrite(&chunkSize,  4, 1, f);
-    fseek(f, 40, SEEK_SET); fwrite(&dataBytes,  4, 1, f);
+    int32_t dataBytes = numSamples * 2;
+    int32_t chunkSize = 36 + dataBytes;
+    fseek(f, 4, SEEK_SET);
+    fwrite(&chunkSize, 4, 1, f);
+    fseek(f, 40, SEEK_SET);
+    fwrite(&dataBytes, 4, 1, f);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,7 +114,7 @@ void AudioEngine::setRecording(bool enabled, const std::string &noisyPath,
                                const std::string &denoisedPath)
 {
     mRecordingEnabled.store(enabled, std::memory_order_relaxed);
-    mNoisyWavPath    = noisyPath;
+    mNoisyWavPath = noisyPath;
     mDenoisedWavPath = denoisedPath;
 }
 
@@ -342,15 +347,20 @@ bool AudioEngine::openStreams(int inputDeviceId, int outputDeviceId, int hopLeng
 
 void AudioEngine::closeStreams()
 {
+    static constexpr int64_t kTimeoutNs = 2000 * oboe::kNanosPerMillisecond;
     if (mPlaybackStream)
     {
         mPlaybackStream->requestStop();
+        oboe::StreamState next = oboe::StreamState::Unknown;
+        mPlaybackStream->waitForStateChange(oboe::StreamState::Stopping, &next, kTimeoutNs);
         mPlaybackStream->close();
         mPlaybackStream.reset();
     }
     if (mRecordingStream)
     {
         mRecordingStream->requestStop();
+        oboe::StreamState next = oboe::StreamState::Unknown;
+        mRecordingStream->waitForStateChange(oboe::StreamState::Stopping, &next, kTimeoutNs);
         mRecordingStream->close();
         mRecordingStream.reset();
     }
@@ -487,26 +497,28 @@ int AudioEngine::recDenoisedRead(float *buf, int n)
 
 void AudioEngine::recorderLoop()
 {
-    FILE *fNoisy    = fopen(mNoisyWavPath.c_str(),    "wb");
+    FILE *fNoisy = fopen(mNoisyWavPath.c_str(), "wb");
     FILE *fDenoised = fopen(mDenoisedWavPath.c_str(), "wb");
 
     if (!fNoisy || !fDenoised)
     {
         LOGE("recorderLoop: cannot open WAV files");
-        if (fNoisy)    fclose(fNoisy);
-        if (fDenoised) fclose(fDenoised);
+        if (fNoisy)
+            fclose(fNoisy);
+        if (fDenoised)
+            fclose(fDenoised);
         return;
     }
 
-    writeWavPlaceholderHeader(fNoisy,    mAiRate);
+    writeWavPlaceholderHeader(fNoisy, mAiRate);
     writeWavPlaceholderHeader(fDenoised, mAiRate);
 
     // Scratch buffer — local, no dynamic allocation in the loop
     static const int kBufSize = 4096;
-    float   fbuf[kBufSize];
+    float fbuf[kBufSize];
     int16_t ibuf[kBufSize];
 
-    int32_t noisySamples    = 0;
+    int32_t noisySamples = 0;
     int32_t denoisedSamples = 0;
 
     while (mRecorderRunning.load(std::memory_order_relaxed) ||
@@ -518,8 +530,10 @@ void AudioEngine::recorderLoop()
         for (int i = 0; i < n; ++i)
         {
             float s = fbuf[i];
-            if (s >  1.f) s =  1.f;
-            if (s < -1.f) s = -1.f;
+            if (s > 1.f)
+                s = 1.f;
+            if (s < -1.f)
+                s = -1.f;
             ibuf[i] = static_cast<int16_t>(s * 32767.f);
         }
         if (n > 0)
@@ -533,8 +547,10 @@ void AudioEngine::recorderLoop()
         for (int i = 0; i < n; ++i)
         {
             float s = fbuf[i];
-            if (s >  1.f) s =  1.f;
-            if (s < -1.f) s = -1.f;
+            if (s > 1.f)
+                s = 1.f;
+            if (s < -1.f)
+                s = -1.f;
             ibuf[i] = static_cast<int16_t>(s * 32767.f);
         }
         if (n > 0)
@@ -546,7 +562,7 @@ void AudioEngine::recorderLoop()
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    finalizeWavHeader(fNoisy,    noisySamples);
+    finalizeWavHeader(fNoisy, noisySamples);
     finalizeWavHeader(fDenoised, denoisedSamples);
     fclose(fNoisy);
     fclose(fDenoised);
@@ -646,7 +662,13 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream * /*stream*
     return oboe::DataCallbackResult::Continue;
 }
 
+void AudioEngine::onErrorBeforeClose(oboe::AudioStream * /*stream*/, oboe::Result error)
+{
+    LOGE("Stream error before close: %s", oboe::convertToText(error));
+    mInferenceRunning.store(false, std::memory_order_relaxed);
+}
+
 void AudioEngine::onErrorAfterClose(oboe::AudioStream * /*stream*/, oboe::Result error)
 {
-    LOGE("Stream error: %s", oboe::convertToText(error));
+    LOGE("Stream error after close: %s", oboe::convertToText(error));
 }

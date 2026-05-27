@@ -29,11 +29,12 @@ public:
     int32_t getBufferSizeFrames() const;
     int32_t getBurstSizeFrames() const;
     int32_t getSampleRateHz() const;
-    int32_t getSharingMode() const;   // 0 = Exclusive, 1 = Shared
+    int32_t getSharingMode() const; // 0 = Exclusive, 1 = Shared
     void getSpectrograms(std::vector<float> &noisyDb, std::vector<float> &denDb);
 
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream *audioStream,
                                           void *audioData, int32_t numFrames) override;
+    void onErrorBeforeClose(oboe::AudioStream *audioStream, oboe::Result error) override;
     void onErrorAfterClose(oboe::AudioStream *audioStream, oboe::Result error) override;
 
 private:
@@ -123,8 +124,8 @@ private:
     // Recording FIFO helpers
     void recNoisyWrite(const float *data, int n);
     void recDenoisedWrite(const float *data, int n);
-    int  recNoisyRead(float *buf, int n);
-    int  recDenoisedRead(float *buf, int n);
+    int recNoisyRead(float *buf, int n);
+    int recDenoisedRead(float *buf, int n);
 };
 
 #endif // AUDIOENGINE_H
