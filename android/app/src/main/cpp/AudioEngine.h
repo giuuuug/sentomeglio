@@ -38,6 +38,57 @@ public:
     void onErrorAfterClose(oboe::AudioStream *audioStream, oboe::Result error) override;
 
 private:
+    // Single-producer / single-consumer lock-free ring buffer of floats.
+    // The acquire/release pairing on `count` ensures data written by the
+    // producer is visible to the consumer before the count increment is
+    // published. read/write indices are each owned by exactly one thread.
+    struct RingFifo
+    {
+        std::vector<float> buffer;
+        int readIdx = 0;  // owned by consumer
+        int writeIdx = 0; // owned by producer
+        std::atomic<int> count{0};
+        int capacity = 0;
+
+        void reset(int cap, int initialFill = 0)
+        {
+            capacity = cap;
+            buffer.assign(cap, 0.0f);
+            readIdx = 0;
+            writeIdx = initialFill;
+            count.store(initialFill, std::memory_order_relaxed);
+        }
+
+        void write(const float *data, int n)
+        {
+            int space = capacity - count.load(std::memory_order_acquire);
+            n = std::min(n, space);
+            for (int i = 0; i < n; ++i)
+            {
+                buffer[writeIdx] = data[i];
+                if (++writeIdx == capacity)
+                    writeIdx = 0;
+            }
+            if (n > 0)
+                count.fetch_add(n, std::memory_order_release);
+        }
+
+        int read(float *data, int n)
+        {
+            int avail = count.load(std::memory_order_acquire);
+            n = std::min(n, avail);
+            for (int i = 0; i < n; ++i)
+            {
+                data[i] = buffer[readIdx];
+                if (++readIdx == capacity)
+                    readIdx = 0;
+            }
+            if (n > 0)
+                count.fetch_sub(n, std::memory_order_release);
+            return n;
+        }
+    };
+
     std::shared_ptr<oboe::AudioStream> mRecordingStream;
     std::shared_ptr<oboe::AudioStream> mPlaybackStream;
 
@@ -48,23 +99,11 @@ private:
     std::vector<float> mMicrophoneBuffer;
     std::vector<float> mDownsampledBuffer;
 
-    // Output FIFO (inference thread → audio callback)
-    // Producer: inference thread writes mInferenceOutputFifoWriteIdx, calls outputFifoWrite()
-    // Consumer: audio callback reads mInferenceOutputFifoReadIdx, calls outputFifoRead()
-    std::vector<float> mInferenceOutputFifo;
-    int mInferenceOutputFifoReadIdx = 0;           // owned by audio callback
-    int mInferenceOutputFifoWriteIdx = 0;          // owned by inference thread
-    std::atomic<int> mInferenceOutputFifoCount{0}; // shared: release/acquire ordering
-    int mInferenceOutputFifoCapacity = 0;
+    // Output FIFO: inference thread = producer, audio callback = consumer.
+    RingFifo mOutputFifo;
 
-    // AI input FIFO (audio callback → inference thread)
-    // Producer: audio callback writes mInferenceInputFifoWriteIdx, calls inputFifoWrite()
-    // Consumer: inference thread reads mInferenceInputFifoReadIdx, calls inputFifoRead()
-    std::vector<float> mInferenceInputFifo;
-    int mInferenceInputFifoReadIdx = 0;  // owned by inference thread
-    int mInferenceInputFifoWriteIdx = 0; // owned by audio callback
-    std::atomic<int> mInferenceInputFifoCount{0};
-    int mInferenceInputFifoCapacity = 0;
+    // AI input FIFO: audio callback = producer, inference thread = consumer.
+    RingFifo mInputFifo;
 
     // Inference-thread-only scratch buffers
     std::vector<float> mModelInputBuffer;
@@ -85,14 +124,6 @@ private:
     bool openStreams(int inputDeviceId, int outputDeviceId, int hopLength);
     void closeStreams();
 
-    // Output FIFO helpers (inference = producer, callback = consumer)
-    void outputFifoWrite(const float *data, int count);
-    int outputFifoRead(float *data, int count);
-
-    // AI FIFO helpers (callback = producer, inference = consumer)
-    void inputFifoWrite(const float *data, int count);
-    int inputFifoRead(float *data, int count);
-
     // ── Recording ─────────────────────────────────────────────────────────────
 public:
     void setRecording(bool enabled, const std::string &noisyPath, const std::string &denoisedPath);
@@ -102,30 +133,16 @@ private:
     std::string mNoisyWavPath;
     std::string mDenoisedWavPath;
 
-    // SPSC FIFOs: audio callback → recorder thread (noisy)
-    //             inference thread → recorder thread (denoised)
-    std::vector<float> mRecordNoisyFifo;
-    int mRecordNoisyReadIdx = 0;
-    int mRecordNoisyWriteIdx = 0;
-    std::atomic<int> mRecordNoisyCount{0};
-    int mRecordNoisyCapacity = 0;
-
-    std::vector<float> mRecordDenoisedFifo;
-    int mRecordDenoisedReadIdx = 0;
-    int mRecordDenoisedWriteIdx = 0;
-    std::atomic<int> mRecordDenoisedCount{0};
-    int mRecordDenoisedCapacity = 0;
+    // Recording FIFOs (producer → recorder thread consumer):
+    //   mRecordNoisyFifo:    audio callback → recorder thread
+    //   mRecordDenoisedFifo: inference thread → recorder thread
+    RingFifo mRecordNoisyFifo;
+    RingFifo mRecordDenoisedFifo;
 
     // Recorder thread
     std::thread mRecorderThread;
     std::atomic<bool> mRecorderRunning{false};
     void recorderLoop();
-
-    // Recording FIFO helpers
-    void recNoisyWrite(const float *data, int n);
-    void recDenoisedWrite(const float *data, int n);
-    int recNoisyRead(float *buf, int n);
-    int recDenoisedRead(float *buf, int n);
 };
 
 #endif // AUDIOENGINE_H

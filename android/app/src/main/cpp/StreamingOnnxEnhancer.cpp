@@ -23,8 +23,8 @@ namespace
 }
 
 StreamingOnnxEnhancer::StreamingOnnxEnhancer(
-    const std::string &modelPath, int sampleRate, int nFft, int hopLength, int winLength)
-    : mSampleRate(sampleRate), mNFft(nFft), mHopLength(hopLength), mWinLength(winLength)
+    const std::string &modelPath, int nFft, int hopLength, int winLength)
+    : mNFft(nFft), mHopLength(hopLength), mWinLength(winLength)
 {
     mNBins = mNFft / 2 + 1;
 
@@ -72,7 +72,7 @@ StreamingOnnxEnhancer::StreamingOnnxEnhancer(
     }
 }
 
-StreamingOnnxEnhancer::~StreamingOnnxEnhancer() {}
+StreamingOnnxEnhancer::~StreamingOnnxEnhancer() = default;
 
 void StreamingOnnxEnhancer::allocateTensors()
 {
@@ -87,9 +87,8 @@ void StreamingOnnxEnhancer::allocateTensors()
         mInputNamesStr.push_back(name_ptr.get());
 
         const std::string &inputName = mInputNamesStr.back();
-        bool isFrameInput = (inputName == "frame" || inputName == "input");
 
-        if (isFrameInput)
+        if (inputName == "frame" || inputName == "input")
         {
             std::vector<int64_t> frame_shape = {1, (int64_t)mNBins, 1};
             mInputTensors.push_back(Ort::Value::CreateTensor<float>(
@@ -200,7 +199,6 @@ void StreamingOnnxEnhancer::processHop(const float *hop_in, float *hop_out)
     auto inf_end = std::chrono::high_resolution_clock::now();
 
     double raw = std::chrono::duration<double, std::milli>(inf_end - inf_start).count();
-    mLastInferenceMs.store(raw);
     double prev = mInferenceEmaMs.load();
     mInferenceEmaMs.store(prev == 0.0 ? raw : kEmaAlpha * raw + (1.0 - kEmaAlpha) * prev);
 
@@ -251,7 +249,8 @@ void StreamingOnnxEnhancer::processHop(const float *hop_in, float *hop_out)
 
     auto dsp_end = std::chrono::high_resolution_clock::now();
 
-    double dspRaw = std::chrono::duration<double, std::milli>(dsp_mid - dsp_start).count() + std::chrono::duration<double, std::milli>(dsp_end - istft_start).count();
+    double dspRaw = std::chrono::duration<double, std::milli>(dsp_mid - dsp_start).count() +
+                    std::chrono::duration<double, std::milli>(dsp_end - istft_start).count();
     double dspPrev = mDspEmaMs.load();
     mDspEmaMs.store(dspPrev == 0.0 ? dspRaw : kEmaAlpha * dspRaw + (1.0 - kEmaAlpha) * dspPrev);
 
@@ -293,5 +292,4 @@ void StreamingOnnxEnhancer::prewarm()
     }
     mInferenceEmaMs.store(0.0);
     mDspEmaMs.store(0.0);
-    mLastInferenceMs.store(0.0);
 }

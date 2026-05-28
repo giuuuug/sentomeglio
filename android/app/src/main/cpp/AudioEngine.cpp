@@ -61,7 +61,7 @@ bool AudioEngine::start(int inputDeviceId, int outputDeviceId,
                         int winLength)
 {
     mEnhancer = std::make_unique<StreamingOnnxEnhancer>(
-        modelPath, mAiRate, nFft, hopLength, winLength);
+        modelPath, nFft, hopLength, winLength);
 
     if (!openStreams(inputDeviceId, outputDeviceId, hopLength))
     {
@@ -82,14 +82,19 @@ bool AudioEngine::start(int inputDeviceId, int outputDeviceId,
         mRecorderThread = std::thread(&AudioEngine::recorderLoop, this);
     }
 
-    oboe::Result result = mRecordingStream->requestStart();
-    if (result != oboe::Result::OK)
+    auto abortStart = [this]()
     {
-        LOGE("Failed to start recording stream: %s", oboe::convertToText(result));
         mInferenceRunning.store(false, std::memory_order_relaxed);
         mInferenceThread.join();
         closeStreams();
         mEnhancer.reset();
+    };
+
+    oboe::Result result = mRecordingStream->requestStart();
+    if (result != oboe::Result::OK)
+    {
+        LOGE("Failed to start recording stream: %s", oboe::convertToText(result));
+        abortStart();
         return false;
     }
 
@@ -97,10 +102,7 @@ bool AudioEngine::start(int inputDeviceId, int outputDeviceId,
     if (result != oboe::Result::OK)
     {
         LOGE("Failed to start playback stream: %s", oboe::convertToText(result));
-        mInferenceRunning.store(false, std::memory_order_relaxed);
-        mInferenceThread.join();
-        closeStreams();
-        mEnhancer.reset();
+        abortStart();
         return false;
     }
 
@@ -300,28 +302,17 @@ bool AudioEngine::openStreams(int inputDeviceId, int outputDeviceId, int hopLeng
     mDownsampledBuffer.resize(maxAiFrames);
 
     // AI input FIFO: callback writes, inference thread reads
-    mInferenceInputFifoCapacity = maxAiFrames * 8;
-    mInferenceInputFifo.assign(mInferenceInputFifoCapacity, 0.0f);
-    mInferenceInputFifoReadIdx = 0;
-    mInferenceInputFifoWriteIdx = 0;
-    mInferenceInputFifoCount.store(0, std::memory_order_relaxed);
+    mInputFifo.reset(maxAiFrames * 8);
 
-    // Output FIFO: inference thread writes, callback reads
-    int hopHwFrames = (hopLength * mHwRate / mAiRate) + 4;
-    mInferenceOutputFifoCapacity = hopHwFrames * 16;
-    if (mInferenceOutputFifoCapacity < 4096)
-        mInferenceOutputFifoCapacity = 4096;
-    mInferenceOutputFifo.assign(mInferenceOutputFifoCapacity, 0.0f);
-    mInferenceOutputFifoReadIdx = 0;
-    mInferenceOutputFifoWriteIdx = 0;
-
+    // Output FIFO: inference thread writes, callback reads.
     // Pre-fill with 1 hop of silence: minimum cushion against the first-hop
     // jitter while keeping algorithmic latency low. The ONNX model is also
     // pre-warmed in start() before streams begin so the first real Run() does
     // not pay model-load cost.
-    int preFill = std::min(hopHwFrames, mInferenceOutputFifoCapacity);
-    mInferenceOutputFifoWriteIdx = preFill;
-    mInferenceOutputFifoCount.store(preFill, std::memory_order_relaxed);
+    int hopHwFrames = (hopLength * mHwRate / mAiRate) + 4;
+    int outputCapacity = std::max(hopHwFrames * 16, 4096);
+    int preFill = std::min(hopHwFrames, outputCapacity);
+    mOutputFifo.reset(outputCapacity, preFill);
 
     // Inference-thread scratch buffers (exact sizes, no resizing at runtime)
     mModelInputBuffer.assign(hopLength, 0.0f);
@@ -330,17 +321,8 @@ bool AudioEngine::openStreams(int inputDeviceId, int outputDeviceId, int hopLeng
     mUpsampledBuffer.resize(maxUpsampled);
 
     // Recording FIFOs: 3 s @ 16 kHz = 48000 samples each
-    mRecordNoisyCapacity = 48000;
-    mRecordNoisyFifo.assign(mRecordNoisyCapacity, 0.f);
-    mRecordNoisyReadIdx = 0;
-    mRecordNoisyWriteIdx = 0;
-    mRecordNoisyCount.store(0, std::memory_order_relaxed);
-
-    mRecordDenoisedCapacity = 48000;
-    mRecordDenoisedFifo.assign(mRecordDenoisedCapacity, 0.f);
-    mRecordDenoisedReadIdx = 0;
-    mRecordDenoisedWriteIdx = 0;
-    mRecordDenoisedCount.store(0, std::memory_order_relaxed);
+    mRecordNoisyFifo.reset(48000);
+    mRecordDenoisedFifo.reset(48000);
 
     return true;
 }
@@ -366,133 +348,6 @@ void AudioEngine::closeStreams()
     }
 }
 
-// ── SPSC FIFO helpers ─────────────────────────────────────────────────────────
-//
-// Output FIFO: inference thread = producer, callback = consumer.
-// The acquire/release pairing on mInferenceOutputFifoCount ensures written data is visible
-// to the consumer before the count increment is published.
-
-void AudioEngine::outputFifoWrite(const float *data, int count)
-{
-    int space = mInferenceOutputFifoCapacity - mInferenceOutputFifoCount.load(std::memory_order_acquire);
-    int n = std::min(count, space);
-    for (int i = 0; i < n; ++i)
-    {
-        mInferenceOutputFifo[mInferenceOutputFifoWriteIdx] = data[i];
-        if (++mInferenceOutputFifoWriteIdx == mInferenceOutputFifoCapacity)
-            mInferenceOutputFifoWriteIdx = 0;
-    }
-    if (n > 0)
-        mInferenceOutputFifoCount.fetch_add(n, std::memory_order_release);
-}
-
-int AudioEngine::outputFifoRead(float *data, int count)
-{
-    int avail = mInferenceOutputFifoCount.load(std::memory_order_acquire);
-    int n = std::min(count, avail);
-    for (int i = 0; i < n; ++i)
-    {
-        data[i] = mInferenceOutputFifo[mInferenceOutputFifoReadIdx];
-        if (++mInferenceOutputFifoReadIdx == mInferenceOutputFifoCapacity)
-            mInferenceOutputFifoReadIdx = 0;
-    }
-    if (n > 0)
-        mInferenceOutputFifoCount.fetch_sub(n, std::memory_order_release);
-    return n;
-}
-
-void AudioEngine::inputFifoWrite(const float *data, int count)
-{
-    int space = mInferenceInputFifoCapacity - mInferenceInputFifoCount.load(std::memory_order_acquire);
-    int n = std::min(count, space);
-    for (int i = 0; i < n; ++i)
-    {
-        mInferenceInputFifo[mInferenceInputFifoWriteIdx] = data[i];
-        if (++mInferenceInputFifoWriteIdx == mInferenceInputFifoCapacity)
-            mInferenceInputFifoWriteIdx = 0;
-    }
-    if (n > 0)
-        mInferenceInputFifoCount.fetch_add(n, std::memory_order_release);
-}
-
-int AudioEngine::inputFifoRead(float *data, int count)
-{
-    int avail = mInferenceInputFifoCount.load(std::memory_order_acquire);
-    int n = std::min(count, avail);
-    for (int i = 0; i < n; ++i)
-    {
-        data[i] = mInferenceInputFifo[mInferenceInputFifoReadIdx];
-        if (++mInferenceInputFifoReadIdx == mInferenceInputFifoCapacity)
-            mInferenceInputFifoReadIdx = 0;
-    }
-    if (n > 0)
-        mInferenceInputFifoCount.fetch_sub(n, std::memory_order_release);
-    return n;
-}
-
-// ── Recording FIFO helpers ────────────────────────────────────────────────────
-// recNoisyWrite: called from audio callback (producer)
-// recDenoisedWrite: called from inference thread (producer)
-// recNoisyRead / recDenoisedRead: called from recorder thread (consumer)
-
-void AudioEngine::recNoisyWrite(const float *data, int n)
-{
-    int space = mRecordNoisyCapacity - mRecordNoisyCount.load(std::memory_order_acquire);
-    n = std::min(n, space);
-    for (int i = 0; i < n; ++i)
-    {
-        mRecordNoisyFifo[mRecordNoisyWriteIdx] = data[i];
-        if (++mRecordNoisyWriteIdx == mRecordNoisyCapacity)
-            mRecordNoisyWriteIdx = 0;
-    }
-    if (n > 0)
-        mRecordNoisyCount.fetch_add(n, std::memory_order_release);
-}
-
-int AudioEngine::recNoisyRead(float *buf, int n)
-{
-    int avail = mRecordNoisyCount.load(std::memory_order_acquire);
-    n = std::min(n, avail);
-    for (int i = 0; i < n; ++i)
-    {
-        buf[i] = mRecordNoisyFifo[mRecordNoisyReadIdx];
-        if (++mRecordNoisyReadIdx == mRecordNoisyCapacity)
-            mRecordNoisyReadIdx = 0;
-    }
-    if (n > 0)
-        mRecordNoisyCount.fetch_sub(n, std::memory_order_release);
-    return n;
-}
-
-void AudioEngine::recDenoisedWrite(const float *data, int n)
-{
-    int space = mRecordDenoisedCapacity - mRecordDenoisedCount.load(std::memory_order_acquire);
-    n = std::min(n, space);
-    for (int i = 0; i < n; ++i)
-    {
-        mRecordDenoisedFifo[mRecordDenoisedWriteIdx] = data[i];
-        if (++mRecordDenoisedWriteIdx == mRecordDenoisedCapacity)
-            mRecordDenoisedWriteIdx = 0;
-    }
-    if (n > 0)
-        mRecordDenoisedCount.fetch_add(n, std::memory_order_release);
-}
-
-int AudioEngine::recDenoisedRead(float *buf, int n)
-{
-    int avail = mRecordDenoisedCount.load(std::memory_order_acquire);
-    n = std::min(n, avail);
-    for (int i = 0; i < n; ++i)
-    {
-        buf[i] = mRecordDenoisedFifo[mRecordDenoisedReadIdx];
-        if (++mRecordDenoisedReadIdx == mRecordDenoisedCapacity)
-            mRecordDenoisedReadIdx = 0;
-    }
-    if (n > 0)
-        mRecordDenoisedCount.fetch_sub(n, std::memory_order_release);
-    return n;
-}
-
 // ── Recorder thread ───────────────────────────────────────────────────────────
 
 void AudioEngine::recorderLoop()
@@ -513,7 +368,7 @@ void AudioEngine::recorderLoop()
     writeWavPlaceholderHeader(fNoisy, mAiRate);
     writeWavPlaceholderHeader(fDenoised, mAiRate);
 
-    // Scratch buffer — local, no dynamic allocation in the loop
+    // Scratch buffers — local, no dynamic allocation in the loop
     static const int kBufSize = 4096;
     float fbuf[kBufSize];
     int16_t ibuf[kBufSize];
@@ -521,44 +376,28 @@ void AudioEngine::recorderLoop()
     int32_t noisySamples = 0;
     int32_t denoisedSamples = 0;
 
-    while (mRecorderRunning.load(std::memory_order_relaxed) ||
-           mRecordNoisyCount.load(std::memory_order_acquire) > 0 ||
-           mRecordDenoisedCount.load(std::memory_order_acquire) > 0)
+    // Drain one FIFO into its WAV file as clamped 16-bit PCM.
+    auto drain = [&](RingFifo &fifo, FILE *f, int32_t &totalSamples)
     {
-        // Drain noisy FIFO
-        int n = recNoisyRead(fbuf, kBufSize);
+        int n = fifo.read(fbuf, kBufSize);
         for (int i = 0; i < n; ++i)
         {
-            float s = fbuf[i];
-            if (s > 1.f)
-                s = 1.f;
-            if (s < -1.f)
-                s = -1.f;
+            float s = std::clamp(fbuf[i], -1.f, 1.f);
             ibuf[i] = static_cast<int16_t>(s * 32767.f);
         }
         if (n > 0)
         {
-            fwrite(ibuf, sizeof(int16_t), n, fNoisy);
-            noisySamples += n;
+            fwrite(ibuf, sizeof(int16_t), n, f);
+            totalSamples += n;
         }
+    };
 
-        // Drain denoised FIFO
-        n = recDenoisedRead(fbuf, kBufSize);
-        for (int i = 0; i < n; ++i)
-        {
-            float s = fbuf[i];
-            if (s > 1.f)
-                s = 1.f;
-            if (s < -1.f)
-                s = -1.f;
-            ibuf[i] = static_cast<int16_t>(s * 32767.f);
-        }
-        if (n > 0)
-        {
-            fwrite(ibuf, sizeof(int16_t), n, fDenoised);
-            denoisedSamples += n;
-        }
-
+    while (mRecorderRunning.load(std::memory_order_relaxed) ||
+           mRecordNoisyFifo.count.load(std::memory_order_acquire) > 0 ||
+           mRecordDenoisedFifo.count.load(std::memory_order_acquire) > 0)
+    {
+        drain(mRecordNoisyFifo, fNoisy, noisySamples);
+        drain(mRecordDenoisedFifo, fDenoised, denoisedSamples);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
@@ -579,13 +418,13 @@ void AudioEngine::inferenceLoop()
     while (mInferenceRunning.load(std::memory_order_relaxed))
     {
         // Wait until a full hop is available.
-        if (mInferenceInputFifoCount.load(std::memory_order_acquire) < mHopLength)
+        if (mInputFifo.count.load(std::memory_order_acquire) < mHopLength)
         {
             std::this_thread::sleep_for(std::chrono::microseconds(500));
             continue;
         }
 
-        inputFifoRead(mModelInputBuffer.data(), mHopLength);
+        mInputFifo.read(mModelInputBuffer.data(), mHopLength);
 
         if (mEnhancer)
         {
@@ -597,17 +436,17 @@ void AudioEngine::inferenceLoop()
         }
 
         if (mRecordingEnabled.load(std::memory_order_relaxed))
-            recDenoisedWrite(mModelOutputBuffer.data(), mHopLength);
+            mRecordDenoisedFifo.write(mModelOutputBuffer.data(), mHopLength);
 
         // Upsample back to HW rate if needed, then push to output FIFO.
         if (mUpsampler)
         {
             int n = mUpsampler->resample(mModelOutputBuffer.data(), mHopLength, mUpsampledBuffer.data());
-            outputFifoWrite(mUpsampledBuffer.data(), n);
+            mOutputFifo.write(mUpsampledBuffer.data(), n);
         }
         else
         {
-            outputFifoWrite(mModelOutputBuffer.data(), mHopLength);
+            mOutputFifo.write(mModelOutputBuffer.data(), mHopLength);
         }
     }
 }
@@ -637,22 +476,19 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream * /*stream*
     }
 
     // Downsample to AI rate (if needed) and push to AI FIFO.
+    const float *aiData = mMicrophoneBuffer.data();
+    int aiFrames = numFrames;
     if (mDownsampler)
     {
-        int n = mDownsampler->resample(mMicrophoneBuffer.data(), numFrames, mDownsampledBuffer.data());
-        inputFifoWrite(mDownsampledBuffer.data(), n);
-        if (mRecordingEnabled.load(std::memory_order_relaxed))
-            recNoisyWrite(mDownsampledBuffer.data(), n);
+        aiFrames = mDownsampler->resample(mMicrophoneBuffer.data(), numFrames, mDownsampledBuffer.data());
+        aiData = mDownsampledBuffer.data();
     }
-    else
-    {
-        inputFifoWrite(mMicrophoneBuffer.data(), numFrames);
-        if (mRecordingEnabled.load(std::memory_order_relaxed))
-            recNoisyWrite(mMicrophoneBuffer.data(), numFrames);
-    }
+    mInputFifo.write(aiData, aiFrames);
+    if (mRecordingEnabled.load(std::memory_order_relaxed))
+        mRecordNoisyFifo.write(aiData, aiFrames);
 
     // Read processed audio from output FIFO.
-    int got = outputFifoRead(out, numFrames);
+    int got = mOutputFifo.read(out, numFrames);
     if (got < numFrames)
     {
         // Output FIFO underrun — zero-fill to avoid noise.

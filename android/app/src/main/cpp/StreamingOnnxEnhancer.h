@@ -12,7 +12,7 @@
 class StreamingOnnxEnhancer
 {
 public:
-    StreamingOnnxEnhancer(const std::string &modelPath, int sampleRate, int nFft, int hopLength, int winLength);
+    StreamingOnnxEnhancer(const std::string &modelPath, int nFft, int hopLength, int winLength);
     ~StreamingOnnxEnhancer();
 
     void processHop(const float *input, float *output);
@@ -24,12 +24,10 @@ public:
     double getDspLatencyMs() const { return mDspEmaMs.load(); }
 
 private:
-    std::atomic<double> mLastInferenceMs{0.0};
     std::atomic<double> mInferenceEmaMs{0.0};
     std::atomic<double> mDspEmaMs{0.0};
     static constexpr double kEmaAlpha = 0.1;
 
-    int mSampleRate;
     int mNFft;
     int mHopLength;
     int mWinLength;
@@ -55,7 +53,6 @@ private:
     std::vector<std::string> mOutputNamesStr;
 
     std::vector<Ort::Value> mInputTensors;
-    std::vector<Ort::Value> mOutputTensors;
     std::vector<std::vector<float>> mStateBacking;
 
     std::vector<float> mNoisyMag;
